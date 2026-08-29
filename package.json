@@ -19,6 +19,12 @@
 		"infra:up": "bash infra/scripts/up.sh",
 		"infra:down": "bash infra/scripts/down.sh",
 		"infra:reset": "bash infra/scripts/reset.sh",
+		"db:generate": "pnpm --filter @mailsentinel/db db:generate",
+		"auth:schema:generate": "pnpm --filter @mailsentinel/db auth:schema:generate",
+		"db:migrate": "pnpm --filter @mailsentinel/db db:migrate",
+		"db:seed": "pnpm --filter @mailsentinel/db db:seed",
+		"db:check": "pnpm --filter @mailsentinel/db db:check",
+		"test:e2e": "pnpm --filter @mailsentinel/web test:e2e",
 		"check-types": "turbo run typecheck"
 	},
 	"devDependencies": {

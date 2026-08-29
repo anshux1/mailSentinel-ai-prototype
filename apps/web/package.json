@@ -10,10 +10,14 @@
 		"lint": "biome lint .",
 		"typecheck": "next typegen && tsc --noEmit",
 		"check-types": "pnpm typecheck",
-		"test": "vitest run"
+		"test": "vitest run",
+		"test:e2e": "playwright test"
 	},
 	"dependencies": {
+		"@mailsentinel/auth": "workspace:*",
+		"@mailsentinel/db": "workspace:*",
 		"@mailsentinel/ui": "workspace:*",
+		"better-auth": "1.7.2",
 		"next": "16.3.3",
 		"react": "19.2.8",
 		"react-dom": "19.2.8",
@@ -27,6 +31,7 @@
 		"@types/node": "^20",
 		"@types/react": "^19",
 		"@types/react-dom": "^19",
+		"@playwright/test": "1.62.1",
 		"tailwindcss": "^4",
 		"typescript": "^5",
 		"vitest": "^3.2.4"

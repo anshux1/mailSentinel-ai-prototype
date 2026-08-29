@@ -1,6 +1,30 @@
 {
 	"$schema": "https://turborepo.dev/schema.json",
 	"ui": "tui",
+	"globalPassThroughEnv": [
+		"APP_ENV",
+		"DATABASE_URL",
+		"BETTER_AUTH_SECRET",
+		"BETTER_AUTH_URL",
+		"BETTER_AUTH_TRUSTED_ORIGINS",
+		"ANALYZER_INTERNAL_URL",
+		"ANALYZER_SERVICE_TOKEN",
+		"S3_ENDPOINT",
+		"S3_REGION",
+		"S3_BUCKET",
+		"S3_ACCESS_KEY_ID",
+		"S3_SECRET_ACCESS_KEY",
+		"S3_FORCE_PATH_STYLE",
+		"MAX_EML_BYTES",
+		"RETENTION_DAYS",
+		"TEST_DATABASE_URL",
+		"SEED_ORGANIZATION_NAME",
+		"SEED_ORGANIZATION_SLUG",
+		"SEED_ANALYST_EMAIL",
+		"SEED_ANALYST_PASSWORD",
+		"SEED_SUPERVISOR_EMAIL",
+		"SEED_SUPERVISOR_PASSWORD"
+	],
 	"tasks": {
 		"dev": {
 			"cache": false,

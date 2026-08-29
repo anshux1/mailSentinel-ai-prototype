@@ -46,6 +46,8 @@ Put values in the files as follows:
 - `apps/analyzer/.env`: set the PostgreSQL and Redis passwords to the root values, copy the same analyzer token and MinIO credentials, and keep `localhost` URLs because `pnpm dev:analyzer` runs on the host.
 - Compose injects container URLs and the same analyzer token when its optional `app` profile is used.
 
+The root `.env` also contains the Phase 2 database and Better Auth values used by the Drizzle CLI and seed script. Keep `BETTER_AUTH_SECRET` consistent with `apps/web/.env`, and replace all synthetic seed password placeholders with local passwords of at least 12 characters. Do not commit either populated environment file.
+
 Start and verify infrastructure:
 
 ```bash
@@ -55,6 +57,16 @@ docker compose --env-file .env -f infra/compose.yaml ps --all minio-init
 ```
 
 The `infra:up` script waits for healthy PostgreSQL, Redis, and MinIO containers and for the successful `minio-init` job. A successful `minio-init` job proves that the private `mailsentinel-evidence` bucket was created or already existed.
+
+Apply the Phase 2 schema and seed the synthetic identity data:
+
+```bash
+pnpm db:migrate
+pnpm db:check
+pnpm db:seed
+```
+
+The seed is idempotent and creates one demo organization with analyst and supervisor memberships. It intentionally creates no cases.
 
 Start the applications in separate terminals:
 
@@ -108,6 +120,23 @@ pnpm build
 pnpm format:check
 ```
 
+If the Better Auth configuration changes, regenerate its reviewed Drizzle schema before generating an application migration:
+
+```bash
+BETTER_AUTH_SECRET="$(openssl rand -hex 32)" pnpm auth:schema:generate
+pnpm db:generate
+```
+
+Review the generated schema and SQL before applying them. The command never applies a migration by itself.
+
+Run browser checks after PostgreSQL has been migrated and seeded:
+
+```bash
+pnpm test:e2e
+```
+
+The browser command reads `E2E_ANALYST_EMAIL` and `E2E_ANALYST_PASSWORD`, falling back to the corresponding synthetic seed variables when they are present in the process environment.
+
 Run a single workspace check:
 
 ```bash
@@ -138,7 +167,10 @@ All Compose ports bind to `127.0.0.1`. The MinIO console is a local administrato
 - Frozen lockfile mismatch: update the lockfile deliberately with the pinned toolchain; do not bypass `--frozen-lockfile` in CI or normal validation.
 - Analyzer liveness passes while readiness fails: liveness only proves the process is running. Check PostgreSQL, Redis, and MinIO status, confirm the host URLs in `apps/analyzer/.env`, and inspect the dependency booleans in `/health/ready`.
 - Missing or too-short secrets: generate new local values, update both application `.env` files, and ensure web, analyzer, and Compose share only `ANALYZER_SERVICE_TOKEN`.
+- Database migration failure: inspect the generated SQL and PostgreSQL logs; do not replace migrations with runtime schema synchronization.
+- Database seed failure: confirm the root `.env` contains `BETTER_AUTH_SECRET`, both synthetic seed passwords, and a reachable PostgreSQL URL. Existing users are not silently assigned new passwords.
+- Sign-in failure after seeding: confirm the web and seed processes use the same database, the seed users are verified, and `BETTER_AUTH_SECRET` is at least 32 characters.
 
 ## Data safety
 
-Use synthetic `.eml` data only during setup validation. Do not commit populated environment files, paste secrets into issues or logs, upload real messages, or expose MinIO, PostgreSQL, Redis, or the analyzer publicly.
+Use synthetic `.eml` data only during setup validation. Use `.test` email addresses for Phase 2 demo users. Do not commit populated environment files, paste secrets into issues or logs, upload real messages, or expose MinIO, PostgreSQL, Redis, or the analyzer publicly. Phase 2 has public sign-up disabled and does not include password reset or email verification delivery.
