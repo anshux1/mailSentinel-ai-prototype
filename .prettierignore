@@ -1,0 +1,14 @@
+node_modules/
+.next/
+.turbo/
+dist/
+build/
+out/
+coverage/
+pnpm-lock.yaml
+uv.lock
+PLAN.md
+SETUP_PLAN.md
+*.py
+Dockerfile
+next-env.d.ts

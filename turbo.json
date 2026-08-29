@@ -1,21 +1,73 @@
 {
-  "$schema": "https://turborepo.dev/schema.json",
-  "ui": "tui",
-  "tasks": {
-    "build": {
-      "dependsOn": ["^build"],
-      "inputs": ["$TURBO_DEFAULT$", ".env*"],
-      "outputs": [".next/**", "!.next/cache/**", "!.next/dev/**"]
-    },
-    "lint": {
-      "dependsOn": ["^lint"]
-    },
-    "check-types": {
-      "dependsOn": ["^check-types"]
-    },
-    "dev": {
-      "cache": false,
-      "persistent": true
-    }
-  }
+	"$schema": "https://turborepo.dev/schema.json",
+	"ui": "tui",
+	"tasks": {
+		"dev": {
+			"cache": false,
+			"persistent": true
+		},
+		"build": {
+			"dependsOn": ["^build"],
+			"inputs": ["$TURBO_DEFAULT$", "package.json", "pnpm-lock.yaml", "tsconfig*.json", "pyproject.toml", "uv.lock"],
+			"outputs": [".next/**", "!.next/cache/**", "!.next/dev/**", "dist/**", "build/**"]
+		},
+		"lint": {
+			"inputs": [
+				"$TURBO_DEFAULT$",
+				"package.json",
+				"pnpm-lock.yaml",
+				"pyproject.toml",
+				"uv.lock",
+				"biome.json",
+				"eslint.config.*",
+				".prettierrc*"
+			],
+			"outputs": []
+		},
+		"typecheck": {
+			"dependsOn": ["^typecheck"],
+			"inputs": [
+				"$TURBO_DEFAULT$",
+				"package.json",
+				"pnpm-lock.yaml",
+				"pyproject.toml",
+				"uv.lock",
+				"tsconfig*.json",
+				".mypy*"
+			],
+			"outputs": []
+		},
+		"test": {
+			"dependsOn": ["^test"],
+			"inputs": [
+				"$TURBO_DEFAULT$",
+				"package.json",
+				"pnpm-lock.yaml",
+				"pyproject.toml",
+				"uv.lock",
+				"apps/*/tests/**",
+				"apps/*/src/**/*.test.*",
+				"packages/*/src/**/*.test.*"
+			],
+			"outputs": []
+		},
+		"format:check": {
+			"inputs": ["$TURBO_DEFAULT$", "package.json", "pnpm-lock.yaml", "pyproject.toml", "uv.lock", ".prettierrc*"],
+			"outputs": []
+		},
+		"contracts:generate": {
+			"dependsOn": ["^contracts:generate"],
+			"outputs": []
+		},
+		"db:generate": {
+			"dependsOn": ["^db:generate"],
+			"cache": false,
+			"outputs": []
+		},
+		"db:migrate": {
+			"dependsOn": ["^db:migrate"],
+			"cache": false,
+			"outputs": []
+		}
+	}
 }

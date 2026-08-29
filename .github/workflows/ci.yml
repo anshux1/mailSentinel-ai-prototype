@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  setup:
+    name: Setup baseline checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: "pnpm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.7"
+          enable-cache: true
+          cache-dependency-glob: apps/analyzer/uv.lock
+
+      - name: Restore Turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo/cache
+          key: ${{ runner.os }}-turbo-${{ hashFiles('pnpm-lock.yaml', 'apps/**/package.json', 'packages/**/package.json') }}
+          restore-keys: |
+            ${{ runner.os }}-turbo-
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install analyzer dependencies
+        run: uv sync --locked --project apps/analyzer
+
+      - name: Validate compose configuration
+        run: docker compose --env-file .env.example -f infra/compose.yaml config --quiet
+
+      - name: Check formatting
+        run: pnpm format:check
+
+      - name: Run lint
+        run: pnpm lint
+
+      - name: Run typecheck
+        run: pnpm typecheck
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build workspaces
+        run: pnpm build
+        env:
+          APP_ENV: test
+          DATABASE_URL: postgresql://mailsentinel:local-password@localhost:5432/mailsentinel
+          BETTER_AUTH_SECRET: 0000000000000000000000000000000000000000000000000000000000000000
+          BETTER_AUTH_URL: http://localhost:3000
+          ANALYZER_INTERNAL_URL: http://localhost:8000
+          ANALYZER_SERVICE_TOKEN: 1111111111111111111111111111111111111111111111111111111111111111
+          S3_ENDPOINT: http://localhost:9000
+          S3_REGION: us-east-1
+          S3_BUCKET: mailsentinel-evidence
+          S3_ACCESS_KEY_ID: local-access-key
+          S3_SECRET_ACCESS_KEY: local-secret-key
+          S3_FORCE_PATH_STYLE: "true"
+          MAX_EML_BYTES: "26214400"
+          RETENTION_DAYS: "90"
+
+      - name: Validate analyzer container build definition
+        run: docker build --target runtime -f apps/analyzer/Dockerfile .

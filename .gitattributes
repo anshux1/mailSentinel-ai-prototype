@@ -1,0 +1,21 @@
+* text=auto eol=lf
+
+*.svg text
+*.woff binary
+*.woff2 binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.avif binary
+*.mov binary
+*.mp4 binary
+*.zip binary
+*.gz binary
+*.pdf binary
+docker-entrypoint.sh text eol=lf
+*.sh text eol=lf
+*.yaml text
+*.yml text

@@ -1,1 +1,1 @@
-# `biome-config`
+# `@mailsentinel/biome-config`

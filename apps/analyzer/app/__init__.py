@@ -1,0 +1,1 @@
+"""MailSentinel analyzer package."""
