@@ -1,5 +1,5 @@
-import { relations } from "drizzle-orm";
-import { index, pgEnum, pgTable, text, timestamp, unique, varchar, boolean } from "drizzle-orm/pg-core";
+import { relations, sql } from "drizzle-orm";
+import { index, pgEnum, pgTable, text, timestamp, unique, uniqueIndex, varchar, boolean } from "drizzle-orm/pg-core";
 
 import { user } from "./auth";
 import { organizations } from "./tenancy";
@@ -42,9 +42,14 @@ export const cases = pgTable(
 		updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
 		retentionUntil: timestamp("retention_until", { withTimezone: true }).notNull(),
 		legalHold: boolean("legal_hold").default(false).notNull(),
+		idempotencyKey: varchar("idempotency_key", { length: 128 }),
 	},
 	(table) => [
 		unique("cases_organization_case_number_unique").on(table.organizationId, table.caseNumber),
+		unique("cases_organization_id_unique").on(table.organizationId, table.id),
+		uniqueIndex("cases_organization_idempotency_key_uidx")
+			.on(table.organizationId, table.idempotencyKey)
+			.where(sql`${table.idempotencyKey} is not null`),
 		index("cases_organization_created_at_idx").on(table.organizationId, table.createdAt),
 		index("cases_organization_status_created_at_idx").on(table.organizationId, table.status, table.createdAt),
 		index("cases_organization_priority_created_at_idx").on(table.organizationId, table.priority, table.createdAt),

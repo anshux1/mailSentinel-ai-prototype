@@ -1,6 +1,6 @@
-import "server-only";
+import { createEnv } from "@t3-oss/env-nextjs";
+import * as z from "zod";
 
-type SecretLike = string | undefined | null;
 type AppEnvironment = "development" | "test" | "production";
 
 interface ServerEnv {
@@ -8,6 +8,7 @@ interface ServerEnv {
 	databaseUrl: URL;
 	betterAuthSecret: string;
 	betterAuthUrl: URL;
+	betterAuthTrustedOrigins: string[];
 	analyzerInternalUrl: URL;
 	analyzerServiceToken: string;
 	s3Endpoint: URL;
@@ -18,6 +19,8 @@ interface ServerEnv {
 	s3ForcePathStyle: boolean;
 	maxEmlBytes: number;
 	retentionDays: number;
+	uploadTimeoutMs: number;
+	analyzerRequestTimeoutMs: number;
 }
 
 const REQUIRED_MIN_LENGTH = 32;
@@ -34,6 +37,8 @@ const developmentDefaults = {
 	s3ForcePathStyle: "true",
 	maxEmlBytes: "26214400",
 	retentionDays: "90",
+	uploadTimeoutMs: "120000",
+	analyzerRequestTimeoutMs: "3000",
 } as const;
 
 function isPlaceholder(value: string): boolean {
@@ -41,148 +46,185 @@ function isPlaceholder(value: string): boolean {
 	return normalized.startsWith("replace-") || normalized.startsWith("your-");
 }
 
-function readRequiredString(name: string, value: SecretLike): string {
-	const resolved = value?.trim();
-	if (!resolved) {
-		throw new Error(`Missing required environment variable: ${name}`);
+function resolveAppEnvironment(runtimeEnv: NodeJS.ProcessEnv): AppEnvironment {
+	const value = runtimeEnv.APP_ENV?.trim() || (runtimeEnv.NODE_ENV === "test" ? "test" : "development");
+	if (value === "development" || value === "test" || value === "production") {
+		return value;
 	}
-
-	return resolved;
+	return value as AppEnvironment;
 }
 
-function readEnvironment(value: SecretLike): AppEnvironment {
-	const environment = (value ?? "development").trim();
-	if (environment === "development" || environment === "test" || environment === "production") {
-		return environment;
-	}
-
-	throw new Error("APP_ENV must be development, test, or production");
+function urlSchema(protocols: readonly string[]) {
+	return z
+		.string()
+		.trim()
+		.refine(
+			(value) => {
+				try {
+					const url = new URL(value);
+					return Boolean(url.hostname) && protocols.includes(url.protocol.slice(0, -1));
+				} catch {
+					return false;
+				}
+			},
+			{ message: `must be a valid URL using ${protocols.join(" or ")}` },
+		);
 }
 
-function readUrl(
-	name: string,
-	value: SecretLike,
-	fallback: string | undefined,
-	allowedProtocols: readonly string[],
-): URL {
-	const resolved = readRequiredString(name, value ?? fallback);
+function postgresUrlSchema() {
+	return urlSchema(["postgres", "postgresql"]);
+}
 
-	try {
-		const url = new URL(resolved);
-		const protocol = url.protocol.slice(0, -1);
-		if (!url.hostname || !allowedProtocols.includes(protocol)) {
-			throw new Error();
+function positiveIntegerSchema(maximum?: number) {
+	const schema = z
+		.string()
+		.trim()
+		.regex(/^[1-9]\d*$/, "must be a positive integer")
+		.transform(Number);
+	return maximum === undefined ? schema : schema.pipe(z.number().max(maximum, `must be at most ${maximum}`));
+}
+
+function booleanSchema() {
+	return z.enum(["true", "false"]).transform((value) => value === "true");
+}
+
+function secretSchema(appEnv: AppEnvironment) {
+	return z
+		.string()
+		.trim()
+		.min(REQUIRED_MIN_LENGTH, `must be at least ${REQUIRED_MIN_LENGTH} characters long`)
+		.refine((value) => appEnv === "test" || !isPlaceholder(value), "must not be a placeholder");
+}
+
+function storageCredentialSchema(appEnv: AppEnvironment) {
+	return z
+		.string()
+		.trim()
+		.min(1)
+		.refine((value) => appEnv === "test" || !isPlaceholder(value), "must not be a placeholder");
+}
+
+function trustedOriginsSchema() {
+	return z
+		.string()
+		.trim()
+		.refine(
+			(value) =>
+				value.split(",").every((origin) => {
+					try {
+						const url = new URL(origin.trim());
+						return url.origin === origin.trim() && ["http:", "https:"].includes(url.protocol);
+					} catch {
+						return false;
+					}
+				}),
+			"must contain valid HTTP or HTTPS origins",
+		)
+		.transform((value) => [...new Set(value.split(",").map((origin) => origin.trim()))]);
+}
+
+function createServerEnv(runtimeEnv: NodeJS.ProcessEnv): ServerEnv {
+	const appEnv = resolveAppEnvironment(runtimeEnv);
+	const betterAuthUrl = runtimeEnv.BETTER_AUTH_URL?.trim() || developmentDefaults.betterAuthUrl;
+	const betterAuthOrigin = (() => {
+		try {
+			return new URL(betterAuthUrl).origin;
+		} catch {
+			return betterAuthUrl;
 		}
-		return url;
-	} catch {
-		throw new Error(`Invalid URL in environment variable: ${name}`);
-	}
-}
+	})();
 
-function readPositiveInt(name: string, value: SecretLike): number {
-	const rawValue = readRequiredString(name, value);
-	if (!/^[1-9]\d*$/.test(rawValue)) {
-		throw new Error(`Invalid positive integer in environment variable: ${name}`);
-	}
-
-	const parsed = Number(rawValue);
-	if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-		throw new Error(`Invalid positive integer in environment variable: ${name}`);
-	}
-	return parsed;
-}
-
-function readBoolean(name: string, value: SecretLike): boolean {
-	const rawValue = readRequiredString(name, value);
-	if (rawValue === "true" || rawValue === "false") {
-		return rawValue === "true";
-	}
-	throw new Error(`Invalid boolean in environment variable: ${name}`);
-}
-
-function rejectPublicSecretVariables(env: NodeJS.ProcessEnv): void {
-	const blockedSegments = ["SECRET", "TOKEN", "PASSWORD", "ACCESS_KEY", "PRIVATE_KEY", "CREDENTIAL", "API_KEY"];
-
-	for (const key of Object.keys(env)) {
-		if (!key.startsWith("NEXT_PUBLIC_")) {
-			continue;
-		}
-		if (blockedSegments.some((segment) => key.includes(segment))) {
-			throw new Error(`Do not expose secret-like values under NEXT_PUBLIC_*: ${key}`);
-		}
-	}
-}
-
-function readSecret(name: string, value: SecretLike, environment: AppEnvironment): string {
-	const secret = readRequiredString(name, value ?? (environment === "test" ? TEST_SECRET : undefined));
-	if (environment === "test") {
-		return secret;
-	}
-	if (isPlaceholder(secret)) {
-		throw new Error(`Placeholder secret is not valid for ${name}`);
-	}
-	if (secret.length < REQUIRED_MIN_LENGTH) {
-		throw new Error(`Secret for ${name} must be at least ${REQUIRED_MIN_LENGTH} characters long`);
-	}
-	return secret;
-}
-
-function rejectPlaceholderCredential(name: string, value: string, environment: AppEnvironment): void {
-	if (environment !== "test" && isPlaceholder(value)) {
-		throw new Error(`Placeholder credential is not valid for ${name}`);
-	}
-}
-
-export function getServerEnv(env: NodeJS.ProcessEnv = process.env): ServerEnv {
-	rejectPublicSecretVariables(env);
-
-	const appEnv = readEnvironment(env.APP_ENV);
-	const databaseUrl = readUrl("DATABASE_URL", env.DATABASE_URL, developmentDefaults.databaseUrl, [
-		"postgres",
-		"postgresql",
-	]);
-	const betterAuthUrl = readUrl("BETTER_AUTH_URL", env.BETTER_AUTH_URL, developmentDefaults.betterAuthUrl, [
-		"http",
-		"https",
-	]);
-	const analyzerInternalUrl = readUrl(
-		"ANALYZER_INTERNAL_URL",
-		env.ANALYZER_INTERNAL_URL,
-		developmentDefaults.analyzerInternalUrl,
-		["http", "https"],
-	);
-	const s3Endpoint = readUrl("S3_ENDPOINT", env.S3_ENDPOINT, developmentDefaults.s3Endpoint, ["http", "https"]);
-	const s3AccessKeyId = readRequiredString(
-		"S3_ACCESS_KEY_ID",
-		env.S3_ACCESS_KEY_ID ?? developmentDefaults.s3AccessKeyId,
-	);
-	const s3SecretAccessKey = readRequiredString(
-		"S3_SECRET_ACCESS_KEY",
-		env.S3_SECRET_ACCESS_KEY ?? developmentDefaults.s3SecretAccessKey,
-	);
-
-	rejectPlaceholderCredential("S3_ACCESS_KEY_ID", s3AccessKeyId, appEnv);
-	rejectPlaceholderCredential("S3_SECRET_ACCESS_KEY", s3SecretAccessKey, appEnv);
+	const parsed = createEnv({
+		server: {
+			APP_ENV: z.enum(["development", "test", "production"]),
+			DATABASE_URL: postgresUrlSchema().transform((value) => new URL(value)),
+			BETTER_AUTH_SECRET: secretSchema(appEnv),
+			BETTER_AUTH_URL: urlSchema(["http", "https"]).transform((value) => new URL(value)),
+			BETTER_AUTH_TRUSTED_ORIGINS: trustedOriginsSchema(),
+			ANALYZER_INTERNAL_URL: urlSchema(["http", "https"]).transform((value) => new URL(value)),
+			ANALYZER_SERVICE_TOKEN: secretSchema(appEnv),
+			S3_ENDPOINT: urlSchema(["http", "https"]).transform((value) => new URL(value)),
+			S3_REGION: z.string().trim().min(1),
+			S3_BUCKET: z.string().trim().min(1),
+			S3_ACCESS_KEY_ID: storageCredentialSchema(appEnv),
+			S3_SECRET_ACCESS_KEY: storageCredentialSchema(appEnv),
+			S3_FORCE_PATH_STYLE: booleanSchema(),
+			MAX_EML_BYTES: positiveIntegerSchema(25 * 1024 * 1024),
+			RETENTION_DAYS: positiveIntegerSchema(),
+			UPLOAD_TIMEOUT_MS: positiveIntegerSchema(600_000),
+			ANALYZER_REQUEST_TIMEOUT_MS: positiveIntegerSchema(30_000),
+		},
+		runtimeEnv: {
+			APP_ENV: runtimeEnv.APP_ENV?.trim() || (runtimeEnv.NODE_ENV === "test" ? "test" : "development"),
+			DATABASE_URL: runtimeEnv.DATABASE_URL ?? developmentDefaults.databaseUrl,
+			BETTER_AUTH_SECRET: runtimeEnv.BETTER_AUTH_SECRET?.trim() || (appEnv === "test" ? TEST_SECRET : undefined),
+			BETTER_AUTH_URL: betterAuthUrl,
+			BETTER_AUTH_TRUSTED_ORIGINS: runtimeEnv.BETTER_AUTH_TRUSTED_ORIGINS?.trim() || betterAuthOrigin,
+			ANALYZER_INTERNAL_URL: runtimeEnv.ANALYZER_INTERNAL_URL ?? developmentDefaults.analyzerInternalUrl,
+			ANALYZER_SERVICE_TOKEN:
+				runtimeEnv.ANALYZER_SERVICE_TOKEN?.trim() || (appEnv === "test" ? TEST_SECRET : undefined),
+			S3_ENDPOINT: runtimeEnv.S3_ENDPOINT ?? developmentDefaults.s3Endpoint,
+			S3_REGION: runtimeEnv.S3_REGION ?? developmentDefaults.s3Region,
+			S3_BUCKET: runtimeEnv.S3_BUCKET ?? developmentDefaults.s3Bucket,
+			S3_ACCESS_KEY_ID: runtimeEnv.S3_ACCESS_KEY_ID ?? developmentDefaults.s3AccessKeyId,
+			S3_SECRET_ACCESS_KEY: runtimeEnv.S3_SECRET_ACCESS_KEY ?? developmentDefaults.s3SecretAccessKey,
+			S3_FORCE_PATH_STYLE: runtimeEnv.S3_FORCE_PATH_STYLE ?? developmentDefaults.s3ForcePathStyle,
+			MAX_EML_BYTES: runtimeEnv.MAX_EML_BYTES ?? developmentDefaults.maxEmlBytes,
+			RETENTION_DAYS: runtimeEnv.RETENTION_DAYS ?? developmentDefaults.retentionDays,
+			UPLOAD_TIMEOUT_MS: runtimeEnv.UPLOAD_TIMEOUT_MS ?? developmentDefaults.uploadTimeoutMs,
+			ANALYZER_REQUEST_TIMEOUT_MS:
+				runtimeEnv.ANALYZER_REQUEST_TIMEOUT_MS ?? developmentDefaults.analyzerRequestTimeoutMs,
+		},
+		emptyStringAsUndefined: true,
+		onValidationError: (issues) => {
+			const variables = issues
+				.map((issue) => {
+					const path = issue.path?.map((part) => String(part)).join(".") ?? "environment";
+					return `${path} (${issue.message})`;
+				})
+				.join(", ");
+			throw new Error(`Invalid environment variables: ${variables}`);
+		},
+	});
 
 	return {
-		appEnv,
-		databaseUrl,
-		betterAuthSecret: readSecret("BETTER_AUTH_SECRET", env.BETTER_AUTH_SECRET, appEnv),
-		betterAuthUrl,
-		analyzerInternalUrl,
-		analyzerServiceToken: readSecret("ANALYZER_SERVICE_TOKEN", env.ANALYZER_SERVICE_TOKEN, appEnv),
-		s3Endpoint,
-		s3Region: readRequiredString("S3_REGION", env.S3_REGION ?? developmentDefaults.s3Region),
-		s3Bucket: readRequiredString("S3_BUCKET", env.S3_BUCKET ?? developmentDefaults.s3Bucket),
-		s3AccessKeyId,
-		s3SecretAccessKey,
-		s3ForcePathStyle: readBoolean(
-			"S3_FORCE_PATH_STYLE",
-			env.S3_FORCE_PATH_STYLE ?? developmentDefaults.s3ForcePathStyle,
-		),
-		maxEmlBytes: readPositiveInt("MAX_EML_BYTES", env.MAX_EML_BYTES ?? developmentDefaults.maxEmlBytes),
-		retentionDays: readPositiveInt("RETENTION_DAYS", env.RETENTION_DAYS ?? developmentDefaults.retentionDays),
+		appEnv: parsed.APP_ENV,
+		databaseUrl: parsed.DATABASE_URL,
+		betterAuthSecret: parsed.BETTER_AUTH_SECRET,
+		betterAuthUrl: parsed.BETTER_AUTH_URL,
+		betterAuthTrustedOrigins: parsed.BETTER_AUTH_TRUSTED_ORIGINS,
+		analyzerInternalUrl: parsed.ANALYZER_INTERNAL_URL,
+		analyzerServiceToken: parsed.ANALYZER_SERVICE_TOKEN,
+		s3Endpoint: parsed.S3_ENDPOINT,
+		s3Region: parsed.S3_REGION,
+		s3Bucket: parsed.S3_BUCKET,
+		s3AccessKeyId: parsed.S3_ACCESS_KEY_ID,
+		s3SecretAccessKey: parsed.S3_SECRET_ACCESS_KEY,
+		s3ForcePathStyle: parsed.S3_FORCE_PATH_STYLE,
+		maxEmlBytes: parsed.MAX_EML_BYTES,
+		retentionDays: parsed.RETENTION_DAYS,
+		uploadTimeoutMs: parsed.UPLOAD_TIMEOUT_MS,
+		analyzerRequestTimeoutMs: parsed.ANALYZER_REQUEST_TIMEOUT_MS,
 	};
 }
+
+function rejectPublicSecretVariables(runtimeEnv: NodeJS.ProcessEnv): void {
+	const blockedSegments = ["SECRET", "TOKEN", "PASSWORD", "ACCESS_KEY", "PRIVATE_KEY", "CREDENTIAL", "API_KEY"];
+	const publicSecret = Object.keys(runtimeEnv).find(
+		(key) => key.startsWith("NEXT_PUBLIC_") && blockedSegments.some((segment) => key.includes(segment)),
+	);
+	if (publicSecret) {
+		throw new Error(`Do not expose secret-like values under NEXT_PUBLIC_*: ${publicSecret}`);
+	}
+}
+
+export function getServerEnv(runtimeEnv: NodeJS.ProcessEnv = process.env): ServerEnv {
+	rejectPublicSecretVariables(runtimeEnv);
+	return createServerEnv(runtimeEnv);
+}
+
+// Importing this module validates the production/build environment. Tests can use
+// getServerEnv with an explicit runtime object without relying on global mutation.
+export const env = getServerEnv();
 
 export type { ServerEnv };

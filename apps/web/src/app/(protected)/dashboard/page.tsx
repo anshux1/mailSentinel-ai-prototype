@@ -1,3 +1,4 @@
+import { can } from "@mailsentinel/auth/permissions";
 import { countCases } from "@mailsentinel/db";
 
 import { EmptyCases } from "../../../components/cases/empty-cases";
@@ -30,7 +31,7 @@ export default async function DashboardPage() {
 						<p className="mt-1 text-sm text-slate-500">The queue will populate when evidence ingestion is enabled.</p>
 					</div>
 				</div>
-				<EmptyCases />
+				<EmptyCases canCreate={can(context.role, "case.create")} />
 			</section>
 		</div>
 	);

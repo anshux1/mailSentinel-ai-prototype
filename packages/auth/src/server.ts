@@ -5,9 +5,7 @@ import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { nextCookies } from "better-auth/next-js";
 import { db } from "@mailsentinel/db";
 
-import { getAuthEnvironment } from "./env";
-
-const environment = getAuthEnvironment();
+import { env as environment } from "./env";
 
 const authOptions = {
 	appName: "MailSentinel",

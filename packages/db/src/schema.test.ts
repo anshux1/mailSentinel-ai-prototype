@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { casePriorityValues, caseStatusValues } from "./schema/cases";
+import { auditActorTypeValues, evidenceArtifactKindValues, providerModeValues } from "./schema/ingestion";
 import { organizationRoleValues } from "./schema/tenancy";
 
 describe("application schema vocabulary", () => {
@@ -22,5 +23,11 @@ describe("application schema vocabulary", () => {
 			"failed",
 		]);
 		expect(casePriorityValues).toEqual(["low", "normal", "high", "critical"]);
+	});
+
+	it("keeps evidence lifecycle vocabularies explicit", () => {
+		expect(evidenceArtifactKindValues).toEqual(["original_eml", "attachment", "report"]);
+		expect(providerModeValues).toEqual(["fixture", "offline", "live"]);
+		expect(auditActorTypeValues).toEqual(["user", "service"]);
 	});
 });

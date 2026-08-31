@@ -45,6 +45,7 @@ Put values in the files as follows:
 - `apps/web/.env`: set the PostgreSQL password to the root value, set `BETTER_AUTH_SECRET` to a generated value, copy the same analyzer token, and use the local MinIO root user/password for the S3 credentials.
 - `apps/analyzer/.env`: set the PostgreSQL and Redis passwords to the root values, copy the same analyzer token and MinIO credentials, and keep `localhost` URLs because `pnpm dev:analyzer` runs on the host.
 - Compose injects container URLs and the same analyzer token when its optional `app` profile is used.
+- `UPLOAD_TIMEOUT_MS` and `ANALYZER_REQUEST_TIMEOUT_MS` bound web intake and analyzer acceptance calls; keep them in `apps/web/.env`.
 
 The root `.env` also contains the Phase 2 database and Better Auth values used by the Drizzle CLI and seed script. Keep `BETTER_AUTH_SECRET` consistent with `apps/web/.env`, and replace all synthetic seed password placeholders with local passwords of at least 12 characters. Do not commit either populated environment file.
 
@@ -58,7 +59,7 @@ docker compose --env-file .env -f infra/compose.yaml ps --all minio-init
 
 The `infra:up` script waits for healthy PostgreSQL, Redis, and MinIO containers and for the successful `minio-init` job. A successful `minio-init` job proves that the private `mailsentinel-evidence` bucket was created or already existed.
 
-Apply the Phase 2 schema and seed the synthetic identity data:
+Apply the database schema and seed the synthetic identity data:
 
 ```bash
 pnpm db:migrate
@@ -68,10 +69,17 @@ pnpm db:seed
 
 The seed is idempotent and creates one demo organization with analyst and supervisor memberships. It intentionally creates no cases.
 
-Start the applications in separate terminals:
+Generate the analyzer contract after changing its Pydantic API models:
+
+```bash
+pnpm contracts:generate
+```
+
+Start the applications in separate terminals. Run the worker separately when testing analyzer deferral:
 
 ```bash
 pnpm dev:analyzer
+pnpm --filter @mailsentinel/analyzer dev:worker
 pnpm dev:web
 ```
 
@@ -82,7 +90,7 @@ curl --fail http://localhost:8000/health/live
 curl --fail http://localhost:8000/health/ready
 ```
 
-The browser communicates with Next.js only. The analyzer URL and service token are server-only configuration.
+The browser communicates with Next.js only. The analyzer URL, service token, S3 credentials and object keys are server-only configuration. Uploads are raw bounded request bodies; the browser never receives a bucket URL.
 
 ## Daily commands
 
@@ -129,6 +137,12 @@ pnpm db:generate
 
 Review the generated schema and SQL before applying them. The command never applies a migration by itself.
 
+Run browser checks after PostgreSQL has been migrated and seeded. Keep the analyzer worker stopped first to observe `queued`, then start it to observe the truthful `analysis_deferred` state:
+
+```bash
+pnpm --filter @mailsentinel/analyzer dev:worker
+```
+
 Run browser checks after PostgreSQL has been migrated and seeded:
 
 ```bash
@@ -173,4 +187,4 @@ All Compose ports bind to `127.0.0.1`. The MinIO console is a local administrato
 
 ## Data safety
 
-Use synthetic `.eml` data only during setup validation. Use `.test` email addresses for Phase 2 demo users. Do not commit populated environment files, paste secrets into issues or logs, upload real messages, or expose MinIO, PostgreSQL, Redis, or the analyzer publicly. Phase 2 has public sign-up disabled and does not include password reset or email verification delivery.
+Use synthetic `.eml` data only during setup validation. The repository-provided `fixtures/synthetic/phase3-minimal.eml` is authored for this project, uses only `.test` addresses and contains no private data. Use `.test` email addresses for demo users. Do not commit populated environment files, paste secrets into issues or logs, upload real messages, or expose MinIO, PostgreSQL, Redis, or the analyzer publicly. Phase 3 preserves bytes and queues/defer analysis; it does not parse message content or produce verdicts.

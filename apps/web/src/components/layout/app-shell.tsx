@@ -34,6 +34,14 @@ export function AppShell({ context, children }: AppShellProps) {
 							>
 								Cases
 							</Link>
+							{(context.role === "analyst" || context.role === "supervisor" || context.role === "admin") && (
+								<Link
+									className="rounded-lg px-3 py-2 text-cyan-300 transition hover:bg-slate-900 hover:text-cyan-200"
+									href="/cases/new"
+								>
+									New case
+								</Link>
+							)}
 						</nav>
 					</div>
 					<div className="flex items-center gap-3">
@@ -53,6 +61,11 @@ export function AppShell({ context, children }: AppShellProps) {
 					<Link className="rounded-lg px-3 py-2 text-slate-300 hover:bg-slate-800" href="/cases">
 						Cases
 					</Link>
+					{(context.role === "analyst" || context.role === "supervisor" || context.role === "admin") && (
+						<Link className="rounded-lg px-3 py-2 text-cyan-300 hover:bg-slate-800" href="/cases/new">
+							New case
+						</Link>
+					)}
 				</nav>
 			</div>
 			<main className="mx-auto w-full max-w-7xl px-6 py-10 lg:px-8">{children}</main>

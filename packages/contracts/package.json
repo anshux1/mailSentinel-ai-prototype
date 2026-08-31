@@ -1,0 +1,15 @@
+{
+	"name": "@mailsentinel/contracts",
+	"version": "0.1.0",
+	"type": "module",
+	"private": true,
+	"exports": {
+		"./analyzer": "./src/analyzer.ts"
+	},
+	"scripts": {
+		"generate": "openapi-typescript ../../apps/analyzer/contracts/openapi.json | prettier --parser typescript > src/analyzer.ts"
+	},
+	"devDependencies": {
+		"openapi-typescript": "^7.10.1"
+	}
+}

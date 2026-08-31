@@ -24,6 +24,7 @@
 		"db:migrate": "pnpm --filter @mailsentinel/db db:migrate",
 		"db:seed": "pnpm --filter @mailsentinel/db db:seed",
 		"db:check": "pnpm --filter @mailsentinel/db db:check",
+		"contracts:generate": "pnpm --filter @mailsentinel/analyzer contracts:export && pnpm --filter @mailsentinel/contracts generate",
 		"test:e2e": "pnpm --filter @mailsentinel/web test:e2e",
 		"check-types": "turbo run typecheck"
 	},

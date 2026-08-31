@@ -1,1245 +1,1427 @@
-# MailSentinel AI - Phase 2 Implementation Plan
+# MailSentinel AI - Phase 3 Evidence Ingestion Plan
 
-> This file replaces the completed setup plan. It is intentionally scoped to Phase 2 of `PLAN.md`: data, authentication and the case shell. It is not a second master plan.
+> This file replaces the Phase 2 plan. It is scoped to Phase 3 of `PLAN.md`: preserving a raw `.eml` file, creating the associated case metadata, authenticating the analyzer intake, enqueueing work, and exposing truthful progress. It does not implement parsing or a verdict.
 
-> **Phase goal:** an authenticated analyst can enter the application, the server can resolve the analyst's organization and role, and every case read is tenant-scoped even though case creation is still deferred.
+> **Phase goal:** an authorized analyst can submit a bounded raw `.eml` file, the exact bytes are protected in object storage with a verified SHA-256 hash, the case and analysis run are persisted, and the analyzer queue receives an authenticated idempotent job.
 
-> **Guiding rule:** authorization is decided on the server from the session and database membership. The browser may request a resource, but it never proves which organization it may access.
+> **Truthfulness rule:** until Phase 4 adds the forensic parser, the system must remain in `queued` or move to `analysis_deferred`. It must never show `completed`, a verdict, or fabricated forensic observations.
 
 ## 1. Phase Contract
 
 ### 1.1 Upstream scope
 
-This plan implements only the following items from `PLAN.md` Phase 2:
+This plan implements the following Phase 3 tasks from `PLAN.md`:
 
-- [ ] Implement Drizzle schema and migrations.
-- [ ] Configure Better Auth using the installed-version documentation.
-- [ ] Add organization membership and roles.
-- [ ] Seed demo users and one organization.
-- [ ] Implement tenant-scoped repositories.
-- [ ] Build the sign-in and dashboard shell.
-- [ ] Build the empty case queue and case detail routes.
-- [ ] Add authorization and tenant-isolation tests.
+- [ ] Build the `.eml` upload UI.
+- [ ] Implement streaming size/type validation.
+- [ ] Compute SHA-256 while receiving.
+- [ ] Store bytes in MinIO/S3.
+- [ ] Create case, artifact and analysis-run records.
+- [ ] Add audit events.
+- [ ] Implement analyzer intake authentication.
+- [ ] Enqueue an idempotent job.
+- [ ] Show queued, progress and failure states.
+- [ ] Verify the storage hash round trip.
 
-The Phase 2 deliverable is:
+The Phase 3 deliverable is:
 
-> Authenticated users see only authorized case data, and the application has a stable data/auth boundary for the evidence-ingestion phase.
+> Upload reliably creates a queued case and protected artifact, and analyzer or queue failure preserves the evidence instead of losing it or returning a false clean result.
 
 ### 1.2 Required outcome
 
 At the end of this phase:
 
-1. A clean database can be created using committed migrations.
-2. Better Auth stores and validates email/password sessions in PostgreSQL.
-3. A seeded analyst and supervisor can sign in and sign out.
-4. A signed-in request resolves a user, one active demo organization, and one application role.
-5. Viewer, analyst, supervisor and admin permissions are represented explicitly.
-6. `/dashboard`, `/cases` and `/cases/[caseId]` are protected server-side.
-7. The case queue has a truthful empty state because ingestion does not exist yet.
-8. A case ID from another organization is indistinguishable from a missing case at the web boundary.
-9. Tests prove authentication, role policy, migration behavior and horizontal tenant isolation.
-10. Phase 3 can add upload, artifacts, analysis runs and queue work without replacing the identity or repository layer.
+1. Only an authenticated analyst, supervisor or admin can submit an upload.
+2. The browser sends the file only to Next.js; it never calls FastAPI or MinIO directly.
+3. Upload validation is bounded by byte size, file name, content type and request timeouts.
+4. The original bytes are streamed to private object storage while their exact size and SHA-256 are calculated.
+5. Object keys contain opaque server-generated IDs and no sender, subject or file-name-derived path.
+6. Case, artifact, analysis-run and audit metadata are persisted with the authenticated organization ID.
+7. A retry with the same idempotency key returns the original result rather than creating a second case.
+8. A same-organization duplicate hash produces a confirmation response; it never leaks another organization's case.
+9. The internal analyzer accepts only a valid service credential and a relation-valid request.
+10. A Dramatiq + Redis job is enqueued using `analysis_run_id` as its idempotency identity.
+11. Queue submission failure preserves the case and artifact and records `analysis_deferred` with a safe error code.
+12. The case page displays the hash, byte size, upload metadata and truthful queued/deferred state without showing raw email content.
+13. Tests cover successful upload, invalid input, oversized input, duplicate handling, hash mismatch, analyzer outage, queue restart, idempotency and tenant isolation.
 
-### 1.3 Phase boundaries
+### 1.3 Explicit non-goals
 
-Do not implement these items in this phase:
+Do not implement these items in Phase 3:
 
-- Raw `.eml` upload or upload progress.
-- SHA-256 ingestion or object-storage writes.
-- Evidence artifacts, attachment storage or chain-of-custody events.
-- FastAPI intake, Dramatiq actors or worker processing.
-- MIME parsing, extraction, enrichment or scoring.
-- Case creation UI or a fake upload button that does not work.
-- Case analysis status transitions beyond defining the future case status type.
-- Provider integrations, fixtures, maps, reports or audit screens.
-- Organization invitations, organization switching, teams or member-management UI.
-- Social login, public sign-up, email delivery or password reset.
-- LLM, ML, Neo4j or production deployment work.
+- MIME parsing or header extraction.
+- Authentication-Results, SPF, DKIM or DMARC evaluation.
+- Received-hop reconstruction or trusted-boundary logic.
+- URL, domain, IP or attachment extraction.
+- DNS, RDAP, GeoIP or reputation calls.
+- Risk, confidence, scoring rules or machine-learning output.
+- Opening, visiting, rendering or executing the email or attachments.
+- Report generation, report downloads or full evidence ledger UI.
+- Organization switching, invitations, teams or membership management.
+- Public sign-up, email verification delivery or password reset.
+- Direct browser access to the object-storage bucket.
+- A fake `completed` state used only to make the demo look finished.
 
-The database may define the minimum future `cases` columns needed by the case shell, but no Phase 2 code may claim that evidence or analysis exists.
+The worker may retrieve and verify the stored object before deferring to the parser phase. It must not inspect it as a forensic parser or create observations.
 
 ## 2. Starting Point
 
-### 2.1 Existing foundation
+### 2.1 Phase 2 foundation to reuse
 
-The completed setup currently provides:
+The Phase 2 implementation already provides:
 
-- A pnpm/Turbo monorepo rooted at `/Users/anshu/sih/prototype`.
-- The Next.js application in `apps/web` as `@mailsentinel/web`.
-- The FastAPI application in `apps/analyzer` as `@mailsentinel/analyzer`.
-- Locked JavaScript and Python dependency files.
-- Shared UI, TypeScript and Biome packages under `packages/`.
-- PostgreSQL, Redis and MinIO Compose services under `infra/compose.yaml`.
-- Server-side web environment parsing in `apps/web/src/server/env.ts`.
-- Analyzer health endpoints and setup-only worker placeholder.
-- Local setup documentation and foundational CI.
+- `apps/web` as the Next.js 16.3.3 application.
+- `packages/auth` with Better Auth 1.7.2, database-backed sessions and email/password sign-in.
+- `packages/db` with Drizzle, PostgreSQL, the generated Better Auth schema and the `cases` table.
+- `TenantScope` and tenant-scoped case repositories.
+- Application roles: `viewer`, `analyst`, `supervisor` and `admin`.
+- `case_status` values including `queued`, `analysis_deferred` and `failed`.
+- `infra/compose.yaml` with PostgreSQL, Redis and a private MinIO bucket.
+- Existing `ANALYZER_INTERNAL_URL` and `ANALYZER_SERVICE_TOKEN` configuration names.
+- Protected `/dashboard`, `/cases` and `/cases/[caseId]` routes.
+- Vitest, Playwright, pytest, Ruff, mypy and CI foundations.
 
-### 2.2 Existing conventions to preserve
+Do not create a second auth client, database client, organization membership table or case repository.
 
-- Use the `@mailsentinel/*` package scope.
-- Preserve the current Biome and Prettier conventions; do not introduce a second formatter.
-- Keep PostgreSQL as the canonical metadata store.
-- Keep Redis out of the authentication session path for now.
-- Keep all analyzer URLs and service credentials server-only.
-- Follow the installed Next.js 16 guides in `node_modules/next/dist/docs/` before adding route, proxy, server-action or dynamic-segment code.
-- Follow the installed Better Auth documentation and generated schema output rather than copying an older example.
-- Do not modify `PLAN.md`; it is the source plan and already has worktree changes that are outside this phase document.
+### 2.2 Current gaps
 
-### 2.3 Missing implementation
+The following must be added or extended:
 
-The following are not present and are the primary outputs of this plan:
+- `evidence_artifacts`, `analysis_runs` and `audit_events` tables.
+- An idempotency key on case intake, or an equivalent tenant-scoped idempotency record.
+- S3/MinIO streaming client in server-only web code.
+- Upload validation and hash pipeline.
+- Analyzer intake contract and token guard.
+- Dramatiq broker, actor and safe deferred behavior.
+- Read-only case status/evidence metadata endpoints.
+- `/cases/new` upload experience and status polling.
+- Synthetic transport fixture and integration test setup.
 
-- `packages/db`.
-- `packages/auth`.
-- A Drizzle configuration and application migrations.
-- Better Auth as a runtime dependency.
-- The Better Auth route handler and client.
-- Organization and membership records.
-- Tenant-scoped case repositories.
-- Sign-in, protected layout, dashboard and case routes.
-- Database, auth and browser security tests for this phase.
+### 2.3 Preflight
 
-### 2.4 Preflight
-
-Run these checks before editing implementation code. Record failures as pre-existing or phase-related; do not hide them by weakening configuration.
+Run the existing Phase 2 checks before adding Phase 3 code:
 
 ```bash
 pnpm install --frozen-lockfile
 uv sync --locked --project apps/analyzer
+pnpm format:check
 pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
-pnpm infra:up
 ```
 
-Confirm that PostgreSQL is reachable using the local connection string in `apps/web/.env`, but do not apply application migrations until the schema workstream is ready.
+Start local dependencies and verify the private bucket before any upload test:
+
+```bash
+pnpm infra:up
+docker compose --env-file .env -f infra/compose.yaml ps
+```
+
+If Docker is unavailable, use a separately managed local PostgreSQL/Redis/MinIO stack only for local development. CI must use disposable services and must never use a demo or production bucket.
 
 ## 3. Decisions To Freeze
 
-Record the decisions below in `docs/adr/0004-data-auth-and-tenant-rbac.md` before implementation. If a decision changes, update the ADR and this file before writing code that depends on it.
+Record these decisions in `docs/adr/0005-evidence-ingestion.md` before implementation. Do not proceed with migrations while any choice changes the ownership or failure semantics below.
 
-| Area | Phase 2 decision | Reason |
+| Area | Decision | Reason |
 |---|---|---|
-| Database driver | `pg` with `drizzle-orm/node-postgres` | A conventional pooled PostgreSQL driver works in the Node runtime and is supported by the Better Auth Drizzle adapter. |
-| Better Auth adapter | Use the current official `@better-auth/drizzle-adapter` package after checking the installed docs | The adapter package and import path have changed across Better Auth releases. |
-| Identity schema | Generate Better Auth core tables from the installed version and review the generated output | Auth tables must match the exact installed version and enabled options. |
-| Application tenancy | App-owned `organizations` and `organization_members` tables | The prototype needs exact application roles and server-side tenant queries, not organization-management endpoints. |
-| Organization plugin | Do not enable Better Auth's `organization()` plugin in Phase 2 | Avoid duplicate membership sources and the plugin's owner/admin/member semantics until invitations or org switching are actually required. |
-| RBAC | Explicit application policy for `viewer`, `analyst`, `supervisor` and `admin` | Case permissions are application permissions and must not depend on UI state or Better Auth default roles. |
-| Session storage | PostgreSQL-backed Better Auth sessions; no Redis secondary storage and no cookie cache initially | Revocation and identity metadata remain easy to inspect, and PostgreSQL stays the source of truth. |
-| Sign-up | Disable public email/password sign-up in the mounted auth configuration | Demo accounts are seeded; an open registration path is not required. |
-| Email flows | No verification email or reset email in this phase; seed accounts are verified through a documented server-side path | Mail delivery is outside the setup and Phase 2 scope. Revisit before any external user access. |
-| Active organization | Resolve the sole demo membership server-side; do not accept an organization ID from the browser as authority | The prototype has one organization and does not need an organization switcher yet. |
-| Case API | Use server components and server repositories for the read-only shell; add public case APIs with the ingestion phase | Avoid building a duplicate transport contract before case data has behavior. |
-| IDs | Use opaque text IDs for application tables, with a stable prefix where useful; never use sequential IDs exposed to the browser | Case and organization identifiers will appear in URLs and logs. |
+| Queue | Dramatiq with Redis | ADR 0002 already selected it for the prototype; it is smaller than Celery for this phase. |
+| Upload transport | Raw request body, not buffered multipart parsing | A single raw stream makes byte accounting and hash calculation explicit and avoids loading a multipart file into memory. |
+| Browser upload headers | `X-Original-Filename`, `Content-Type`, `Idempotency-Key` and optional `X-Allow-Duplicate` | The file bytes stay in the request body while metadata remains bounded and explicit. |
+| Web runtime | Node.js runtime for upload and S3 routes | The route needs Node streams, hashing and the AWS SDK. |
+| Object storage | Private MinIO/S3 bucket with server credentials | Original evidence must not be exposed to the browser or stored in PostgreSQL. |
+| Hash | SHA-256 of the exact received bytes | It is reproducible, widely supported and required by the master plan. |
+| Duplicate behavior | Check hash only within the resolved organization; require explicit confirmation for a new case | This supports investigation without cross-tenant existence leakage. |
+| Retry behavior | Require a bounded idempotency key for each intake attempt | A browser retry after a response timeout must not create duplicate evidence records. |
+| Queue outage | Preserve metadata and artifact; set `analysis_deferred` and return a safe `503` response containing the case ID | Evidence preservation is more important than pretending analysis was accepted. |
+| Parser boundary | A Phase 3 worker verifies integrity and then defers with `PARSER_NOT_AVAILABLE` | Phase 4 owns parsing; this phase must not produce a false completed analysis. |
+| Evidence downloads | Not exposed yet | Signed URLs and evidence presentation need a reviewed evidence-access policy in a later dashboard phase. |
 
-### 3.1 Organization plugin contingency
+### 3.1 Existing Phase 2 contracts that must not change
 
-If the team decides that Better Auth's organization plugin is required, stop before creating migrations. Do not add the plugin alongside the app-owned membership table. Instead:
+- Better Auth remains the only identity provider.
+- `resolveWorkspaceContext()` remains the source of the authenticated organization and role.
+- Web repositories accept a database-owned tenant scope, never a browser-provided organization ID.
+- PostgreSQL remains the metadata source of truth.
+- Redis remains temporary queue/cache infrastructure.
+- Existing `.env` files remain ignored and examples contain placeholders only.
 
-1. Revisit the ADR and choose one membership source.
-2. Generate the plugin schema with the installed Better Auth CLI.
-3. Map the plugin's schema names and fields deliberately if the application still requires `organizations` and `organization_members`.
-4. Define custom roles with the current access-control API, including all built-in permissions needed by enabled plugin endpoints.
-5. Add plugin schema and role behavior to the migration and security tests.
+## 4. End-to-End Workflow
 
-## 4. Target Boundaries
+### 4.1 Successful request
 
-### 4.1 Package responsibilities
-
-`@mailsentinel/db` owns:
-
-- PostgreSQL pool and Drizzle instance.
-- Generated Better Auth schema import.
-- Application schema for organizations, memberships and the case shell.
-- Drizzle configuration and migration files.
-- Seed and test database helpers.
-- Tenant-scoped repository functions.
-
-`@mailsentinel/auth` owns:
-
-- Better Auth server construction.
-- Better Auth client construction.
-- Session type exports.
-- Application role and permission definitions.
-- Session-to-organization context helpers that depend on the database.
-
-`@mailsentinel/web` owns:
-
-- Next.js route handlers and pages.
-- Sign-in form and navigation shell.
-- Server-page authorization boundaries.
-- User-facing error, loading and empty states.
-
-`apps/analyzer` remains unchanged except for configuration or health-test adjustments needed by the root checks. It must not receive queue or forensic code in Phase 2.
-
-### 4.2 Dependency direction
-
-Use this direction and reject imports that point the other way:
+Implement the request path in this order:
 
 ```text
-apps/web -> @mailsentinel/auth -> @mailsentinel/db
-apps/web -> @mailsentinel/ui
-@mailsentinel/auth -> better-auth
-@mailsentinel/db -> drizzle-orm, pg
+browser selects bounded .eml file
+  -> client validates obvious local constraints
+  -> client generates Idempotency-Key
+  -> client sends raw bytes to Next.js POST /api/cases
+  -> Next.js validates origin, session, role, headers and content length
+  -> Next.js checks existing idempotency key for this organization
+  -> Next.js streams bytes to private S3/MinIO while hashing and counting
+  -> Next.js verifies the completed object metadata
+  -> Next.js checks same-organization duplicate SHA-256
+  -> PostgreSQL transaction inserts case, artifact, analysis run and audit events
+  -> Next.js calls authenticated FastAPI POST /v1/analyses
+  -> FastAPI validates request relation and enqueues the Dramatiq message
+  -> Next.js returns case ID and queued status
+  -> browser navigates to case detail and polls minimized status
 ```
 
-The database package must not import from `apps/web`. The auth package must not import page components. Client bundles must never import the server auth instance or database pool.
+### 4.2 Failure semantics
 
-`@mailsentinel/db` must expose a small structural tenant-scope type, such as `TenantScope = { organizationId: string }`, rather than importing a workspace-context type from `@mailsentinel/auth`. The auth package may resolve a richer `WorkspaceContext`, but web code must adapt it to the database-owned tenant scope when calling repositories. This keeps the dependency direction acyclic.
+| Failure point | Persist object? | Persist metadata? | Response/state | Required cleanup |
+|---|---:|---:|---|---|
+| Missing session or insufficient role | No | No | `401` or `403` | None. |
+| Invalid origin, filename, content type or idempotency key | No | No | `400` | None. |
+| Known `Content-Length` over limit | No | No | `413` | Do not start storage upload. |
+| Stream exceeds limit | Maybe partial | No | `413` | Abort multipart upload and remove partial object. |
+| Empty body | No | No | `400` | None. |
+| S3/MinIO write failure | No complete object | No | `503` safe intake error | Abort and clean incomplete upload. |
+| Hash or object metadata mismatch | Untrusted object not retained | No | `503` integrity error | Delete object; alert through safe logs. |
+| Duplicate hash without confirmation | Temporary object removed | No new rows | `409 DUPLICATE_ARTIFACT` | Delete temporary object. |
+| PostgreSQL transaction failure | Complete object may exist briefly | No committed rows | `500` safe intake error | Best-effort object deletion; record only safe cleanup diagnostics. |
+| Analyzer unavailable after DB commit | Yes | Yes | `503 ANALYSIS_DEFERRED` and case ID | Keep evidence; no deletion. |
+| Analyzer rejects relation/contract | Yes | Yes | `503` or `409` according to code | Keep evidence; mark run safely failed/deferred. |
+| Redis enqueue failure | Yes | Yes | `503 ANALYSIS_DEFERRED` and case ID | Keep evidence; allow operational retry later. |
+| Browser disconnect after commit | Yes | Yes | Client sees network failure | Retry with same idempotency key returns the original case. |
+| Worker object verification failure | Yes | Yes | `failed` or `analysis_deferred` with safe code | Preserve object for investigation; never overwrite it. |
 
-### 4.3 Request authorization flow
+Never delete a committed original artifact solely because analysis is unavailable.
 
-Every protected server page follows this conceptual flow:
+### 4.3 State model for this phase
+
+The case and analysis run use the existing status vocabulary, but Phase 3 permits only these transitions:
 
 ```text
-request
-  -> read Better Auth session from request headers
-  -> reject or redirect when there is no valid session
-  -> resolve the user's organization membership from PostgreSQL
-  -> resolve the explicit application role
-  -> authorize the requested operation
-  -> execute a repository query containing the resolved organization ID
-  -> return a minimized display projection
+new intake -> queued
+queued -> analysis_deferred        # analyzer/queue unavailable or parser not implemented
+queued -> failed                   # integrity or permanent intake/worker failure
 ```
 
-No step may use an organization ID supplied only by a query string, hidden form field, client store or React prop as proof of access.
+Do not transition to `parsing`, `extracting`, `enriching`, `scoring` or `completed` until the corresponding later phase owns that transition.
 
-## 5. Database Design
+## 5. Database Extension
 
-### 5.1 Package layout
+### 5.1 Migration rules
 
-Create the following shape. Do not add empty parser, enrichment or report directories to this package.
+Create a new Drizzle migration after reviewing the existing Phase 2 migration. Do not edit the applied Phase 2 migration and do not use runtime schema synchronization.
 
-```text
-packages/db/
-├── src/
-│   ├── client.ts
-│   ├── env.ts
-│   ├── schema/
-│   │   ├── auth.ts              # Generated by Better Auth CLI; review, do not hand-edit
-│   │   ├── tenancy.ts
-│   │   ├── cases.ts
-│   │   └── index.ts
-│   ├── repositories/
-│   │   ├── organizations.ts
-│   │   ├── memberships.ts
-│   │   └── cases.ts
-│   ├── test-utils.ts
-│   └── index.ts
-├── drizzle/
-├── drizzle.config.ts
-├── seed.ts
-├── package.json
-└── README.md
-```
+Before generating SQL:
 
-The exact generated auth schema filename may differ if the installed CLI requires another location. Keep the generated file inside `packages/db/src/schema/` and expose it through `schema/index.ts`.
+1. Inspect the existing `cases` schema and enum definitions.
+2. Add only Phase 3 columns/tables.
+3. Review foreign-key deletion behavior.
+4. Review every index and uniqueness rule.
+5. Generate the migration with the existing `pnpm db:generate` command.
+6. Inspect the SQL for unintended drops or enum replacement.
+7. Apply it to a clean database and an already Phase 2-migrated database.
 
-### 5.2 Better Auth tables
+### 5.2 Extend `cases`
 
-Generate the core schema for the exact Better Auth version and configuration. At minimum, review:
+Add an optional `idempotency_key` column to `cases`:
 
-- `user`.
-- `session`.
-- `account`.
-- `verification`.
-
-Rules:
-
-- Do not hand-design Better Auth tables from memory.
-- Do not edit generated auth schema to make it look like the application schema.
-- Do not add the organization plugin tables while the plugin is disabled.
-- Do not configure Redis secondary storage because that changes where sessions and verification records live.
-- Verify the generated schema includes the fields required by email/password sessions and the installed Better Auth release.
-- Keep the generated logical field names expected by Better Auth; map SQL column names only after reviewing the adapter's current field-mapping rules.
-
-### 5.3 `organizations`
-
-This is an application table, not a Better Auth table.
-
-| Column | Type/rule | Purpose |
+| Column | Rule | Purpose |
 |---|---|---|
-| `id` | opaque text primary key | Tenant identifier. |
-| `name` | bounded non-empty text | Display name. |
-| `slug` | bounded text, unique | Stable internal/display slug. |
-| `created_at` | `timestamptz`, default current time | Creation time in UTC. |
+| `idempotency_key` | nullable bounded text, maximum 128 characters | Client retry identity for intake. |
 
-Do not store message content, credentials or provider data here.
+Add a partial unique index on `(organization_id, idempotency_key)` where the key is not null. A key is scoped to an organization; it must never be globally queried without that scope.
 
-### 5.4 `organization_members`
+Do not use the original filename, subject or sender as an idempotency key.
 
-| Column | Type/rule | Purpose |
+### 5.3 `evidence_artifacts`
+
+Create the artifact metadata table:
+
+| Column | Rule | Purpose |
 |---|---|---|
-| `id` | opaque text primary key | Membership record identifier. |
-| `organization_id` | non-null foreign key to `organizations.id` | Tenant owner. |
-| `user_id` | non-null foreign key to the Better Auth user table | Authenticated principal. |
-| `role` | checked text or PostgreSQL enum | `viewer`, `analyst`, `supervisor` or `admin`. |
-| `created_at` | `timestamptz`, default current time | Membership creation time. |
-
-Constraints and indexes:
-
-- Unique `(organization_id, user_id)`.
-- Index `(user_id)` for session-to-membership resolution.
-- Index `(organization_id, role)` for future administrative views.
-- Foreign keys use deliberate deletion behavior; do not allow a user deletion to orphan a membership.
-- A membership role is always one of the four application roles. Unknown roles fail closed.
-- Membership changes are not exposed through a Phase 2 UI.
-
-### 5.5 `cases` shell table
-
-Create the minimum case table required by the empty queue, detail route and future ingestion work. It is metadata only in this phase.
-
-| Column | Type/rule | Purpose |
-|---|---|---|
-| `id` | opaque text primary key | Case identifier used by URLs and repositories. |
-| `organization_id` | non-null foreign key to `organizations.id` | Tenant owner. |
-| `case_number` | bounded text, unique per organization | Human-readable case reference. |
-| `title` | bounded text | Safe display title. |
-| `status` | checked text or enum | Future lifecycle state; no Phase 2 worker writes it. |
-| `priority` | checked text or enum | `low`, `normal`, `high` or `critical`. |
-| `submitted_by` | nullable foreign key to Better Auth user | Future uploader identity. |
-| `original_filename` | nullable bounded text | Future sanitized filename; no upload writes it yet. |
-| `message_received_at` | nullable `timestamptz` | Future message date from the email. |
-| `created_at` | `timestamptz`, default current time | Case creation time. |
-| `updated_at` | `timestamptz`, default current time | Metadata update time. |
-| `retention_until` | `timestamptz` | Future retention deadline. |
-| `legal_hold` | boolean, default false | Future deletion protection. |
-
-Define the future status values from `PLAN.md` in one source of truth:
-
-```text
-queued
-parsing
-extracting
-enriching
-scoring
-completed
-parse_failed
-analysis_deferred
-enrichment_partial
-failed
-```
-
-The Phase 2 UI may render these values for synthetic repository tests, but the product seed must contain no cases and no fake analysis results.
+| `id` | opaque text primary key | Artifact identifier used in object keys. |
+| `organization_id` | non-null FK to `organizations.id` | Tenant owner. |
+| `case_id` | non-null FK to `cases.id` | Case owner. |
+| `kind` | enum: `original_eml`, `attachment`, `report` | Phase 3 inserts only `original_eml`; future values reserve the contract. |
+| `object_key` | non-null bounded text, unique | Private S3/MinIO object location. |
+| `sha256` | non-null lowercase hex text of length 64 | Exact object digest. |
+| `content_type` | non-null bounded text | Validated/requested content type. |
+| `byte_size` | non-negative integer | Exact received byte count. |
+| `encryption_key_reference` | nullable bounded text | Future KMS/application encryption reference. |
+| `created_at` | UTC `timestamptz` | Receive/persistence time. |
 
 Indexes and constraints:
 
-- Unique `(organization_id, case_number)`.
-- Index `(organization_id, created_at desc)` for the queue.
-- Index `(organization_id, status, created_at desc)` for future filters.
-- Index `(organization_id, priority, created_at desc)` for future queue views.
-- Check `legal_hold` is never nullable.
-- Check `retention_until` is not earlier than `created_at` when the database can enforce it without blocking future imports.
-- Do not add evidence, hash, artifact, verdict or observation columns to this table.
+- Index `(organization_id, sha256)` for same-tenant duplicate detection.
+- Index `(organization_id, case_id, created_at)` for case artifact metadata.
+- Unique `object_key`.
+- Check SHA-256 is exactly 64 lowercase hexadecimal characters.
+- Check `byte_size` is greater than zero for `original_eml`.
+- Foreign keys prevent an artifact from pointing to another organization’s case.
+- Do not add a unique hash constraint; explicit duplicate confirmation permits a new case with the same artifact hash.
 
-### 5.6 Future tables intentionally deferred
+### 5.4 `analysis_runs`
 
-Do not create these tables in Phase 2 unless a migration dependency proves that the exact table is required by the chosen Better Auth version:
+Create one row for each requested analysis run:
 
-- `evidence_artifacts`.
-- `analysis_runs`.
-- `verdicts`.
-- `evidence_observations`.
-- `indicators` and `case_indicators`.
-- `relay_hops`.
-- `attachments`.
-- `provider_observations`.
-- `audit_events`.
+| Column | Rule | Purpose |
+|---|---|---|
+| `id` | opaque text primary key | Queue idempotency identity. |
+| `organization_id` | non-null FK to organizations | Tenant owner. |
+| `case_id` | non-null FK to cases | Case being analyzed. |
+| `status` | existing case status vocabulary | Starts at `queued`. |
+| `analysis_version` | non-null bounded text | Analysis implementation version. |
+| `rules_version` | non-null bounded text | Rule contract version; use an ingestion-only value until scoring exists. |
+| `model_version` | nullable bounded text | Null in Phase 3. |
+| `started_at` | nullable UTC timestamp | Null until parser work begins. |
+| `completed_at` | nullable UTC timestamp | Null for queued/deferred runs. |
+| `failure_code` | nullable bounded machine code | Safe operational failure code. |
+| `failure_message_safe` | nullable bounded text | User-safe explanation without message content. |
+| `provider_mode` | enum: `fixture`, `offline`, `live` | Use `offline` in Phase 3 because no provider enrichment runs. |
+| `created_at` | UTC timestamp | Run creation time. |
+| `updated_at` | UTC timestamp | Last lifecycle update. |
 
-Phase 3 owns evidence, analysis-run and audit table design. This keeps the migration reviewable and prevents unimplemented data from looking complete.
+Constraints and indexes:
 
-## 6. Migration Workflow
+- Index `(organization_id, case_id, created_at)`.
+- Index `(status, updated_at)` for operational queue views.
+- Foreign key `(organization_id, case_id)` must not permit a cross-tenant pair. If PostgreSQL cannot enforce this with the current keys, enforce the relation in the transaction and repository query.
+- At most one active Phase 3 run may be associated with a given idempotency key.
+- No verdict row is created in this phase.
 
-### 6.1 Install dependencies
+### 5.5 `audit_events`
 
-Add only dependencies needed for this phase:
+Create an append-only audit table:
 
-- `better-auth` at a version pinned for the project.
-- The matching Better Auth Drizzle adapter package.
-- `drizzle-orm`.
-- `drizzle-kit` as a development dependency.
-- `pg` and its TypeScript types.
-- Any exact Better Auth CLI package required by the installed release.
-- A test runner dependency in `@mailsentinel/db` only if the package owns database tests.
+| Column | Rule | Purpose |
+|---|---|---|
+| `id` | opaque text primary key | Event identifier. |
+| `organization_id` | non-null FK to organizations | Tenant scope. |
+| `actor_type` | enum `user` or `service` | Initiator category. |
+| `actor_id` | bounded text | Better Auth user ID or safe service ID such as `analyzer`. |
+| `action` | bounded text | Examples: `case.created`, `evidence.uploaded`, `analysis.queued`, `analysis.deferred`, `case.viewed`. |
+| `case_id` | nullable FK to cases | Related case when applicable. |
+| `target_type` | bounded text | `case`, `evidence_artifact` or `analysis_run`. |
+| `target_id` | nullable bounded text | Related entity identifier. |
+| `request_id` | non-null bounded text | Correlation ID. |
+| `ip_address_masked` | nullable bounded text | Masked address only; never raw forwarded chains. |
+| `metadata_redacted` | JSONB/object | Counts, status and IDs only; no message body/header. |
+| `created_at` | UTC timestamp | Append time. |
 
-Do not install Redis auth storage, organization-plugin packages, OAuth provider SDKs or upload libraries for this phase.
+Rules:
 
-### 6.2 Generate and review the auth schema
+- Expose insert-only audit helpers; do not expose update/delete helpers.
+- Append a new correction event instead of changing an old event.
+- Do not write an event for every polling request; polling is not an analyst evidence view.
+- Record `case.viewed` on the initial authorized case page request if that page is treated as a case access event.
+- Record `evidence.viewed` only when a future authorized artifact download is implemented; Phase 3 has no artifact download endpoint.
 
-Before running the CLI:
+### 5.6 Repository surface
 
-1. Read the installed Better Auth docs and package version.
-2. Create the server config with only the Phase 2 features enabled.
-3. Confirm the CLI can load the config without connecting to a production database.
-4. Run the installed CLI help command and use its current `generate` syntax.
-5. Generate the Drizzle schema into `packages/db/src/schema/auth.ts` or the documented equivalent.
-6. Review every generated table and column.
-7. Re-run generation after any auth option or plugin change.
-
-The current Better Auth documentation uses commands similar to the following. Treat this as a shape, not a command to copy blindly:
-
-```bash
-pnpm dlx auth@<resolved-version> generate \
-  --config ./packages/auth/src/server.ts \
-  --adapter drizzle \
-  --dialect postgresql \
-  --output ./packages/db/src/schema/auth.ts
-```
-
-Use the exact `--dialect` value and output behavior reported by the installed CLI. Pin the resolved version in the package/tooling documentation; do not use an unpinned `latest` command in CI.
-
-### 6.3 Combine schemas
-
-`packages/db/src/schema/index.ts` must export the generated auth schema and application schema from one import surface for Drizzle Kit and the runtime client.
-
-Requirements:
-
-- No duplicate table declarations.
-- Explicit relations for application tables where Drizzle needs them.
-- Foreign keys target the actual generated Better Auth user table.
-- The Drizzle runtime receives the complete schema needed by repositories and the Better Auth adapter.
-- The Better Auth adapter receives the schema/model mapping required by the installed release.
-- Do not enable Drizzle joins until the generated and application relations have been reviewed; joins are not needed for the first case shell.
-
-### 6.4 Generate application migrations
-
-Configure `packages/db/drizzle.config.ts` for PostgreSQL, the combined schema and a committed migration directory. Use the existing database environment source without importing web application modules into the database package.
-
-Add package/root commands with these responsibilities:
-
-| Command | Responsibility |
-|---|---|
-| `db:generate` | Generate a migration from reviewed schema changes. |
-| `db:migrate` | Apply committed migrations; never silently push schema. |
-| `db:seed` | Idempotently create synthetic demo identity and tenancy data. |
-| `db:check` | Verify the configured database connection and expected tables. |
-
-Workflow:
-
-```bash
-pnpm --filter @mailsentinel/db db:generate
-pnpm --filter @mailsentinel/db db:migrate
-pnpm --filter @mailsentinel/db db:seed
-```
-
-Review generated SQL before applying it. Do not use `drizzle-kit push` as the repository migration workflow. Do not edit an already-applied migration; create a follow-up migration.
-
-### 6.5 Migration acceptance
-
-- A clean PostgreSQL volume can be migrated from zero.
-- Running migrations a second time is a no-op.
-- Generated Better Auth tables match the installed configuration.
-- Application tables have tenant foreign keys and expected constraints.
-- Migration failure does not leave a misleading success marker.
-- The root `db:migrate` task is uncached and is never run implicitly by a page request or build.
-
-## 7. Better Auth Implementation
-
-### 7.1 Server package files
-
-Create the following, adjusting names only if the installed package conventions require it:
+Extend `@mailsentinel/db` with narrow functions:
 
 ```text
-packages/auth/
-├── src/
-│   ├── env.ts
-│   ├── permissions.ts
-│   ├── server.ts
-│   ├── client.ts
-│   ├── context.ts
-│   └── index.ts
-├── package.json
-└── README.md
-```
-
-`server.ts` must be server-only and export the single mounted Better Auth instance. `client.ts` must export only the browser-safe auth client. Do not export the database pool from the auth package.
-
-### 7.2 Server configuration requirements
-
-Build the server config from the current Better Auth API and the generated schema. It must:
-
-- Set an explicit application name.
-- Use the PostgreSQL Drizzle adapter.
-- Enable email/password authentication.
-- Disable public sign-up in the mounted runtime instance.
-- Use a minimum password length of at least 12 for any seed-only creation path.
-- Keep the maximum password length within the installed Better Auth limits.
-- Use a fixed, validated `BETTER_AUTH_URL`.
-- Configure the local and deployed trusted origins explicitly.
-- Keep CSRF and origin checks enabled.
-- Keep HTTP-only, same-site cookies; use secure cookies in production.
-- Use PostgreSQL-backed sessions with an explicit expiration and refresh policy.
-- Keep auth rate limiting enabled; set a stricter sign-in rule after checking the installed option names.
-- Avoid cookie cache until its revocation tradeoff is reviewed.
-- Add `nextCookies()` when using server actions or server-side Better Auth calls, and keep it last in the plugin list as required by the current Next.js integration guide.
-- Avoid OAuth, organization, admin, two-factor and password-reset plugins in this phase.
-- Use Better Auth's default password hashing unless a documented requirement justifies a reviewed replacement.
-- Configure logging so auth errors never include passwords, tokens, raw request bodies or full database URLs.
-
-Do not hard-code secrets in `server.ts`. The package may have its own small environment parser, but it must not import `apps/web/src/server/env.ts` because that would invert the package boundary. If validation logic is shared later, extract it into a real shared package rather than importing across apps.
-
-### 7.3 Seed-only user creation
-
-The mounted runtime must not expose sign-up, but the seed needs a safe way to create users with Better Auth's password hashing.
-
-Use this order of preference after checking the installed release:
-
-1. Use the documented server-side user-creation API that hashes passwords and allows a verified user to be created.
-2. If that API is only available through a plugin that is not otherwise required, create a seed-only auth instance or script that is never mounted as an HTTP handler.
-3. If a seed-only `signUpEmail` path is used, set `autoSignIn` off, mark the user verified through the documented server-side method, and ensure the public instance still has sign-up disabled.
-
-Never insert a plaintext password or hand-construct a Better Auth account hash. Never log seed passwords. The chosen method and the exact Better Auth version must be recorded in `packages/db/README.md`.
-
-### 7.4 Client configuration
-
-Create a browser-safe client using the current React/Next.js Better Auth client import. It must:
-
-- Use same-origin requests to the mounted `/api/auth` route.
-- Export sign-in and sign-out methods needed by the UI.
-- Not contain `BETTER_AUTH_SECRET`, database URLs, service tokens or storage credentials.
-- Not be used as the authority for protected page rendering.
-- Redirect only to fixed local application paths after a successful sign-in; do not accept arbitrary callback URLs from form input.
-
-### 7.5 Next.js route handler
-
-Add:
-
-```text
-apps/web/src/app/api/auth/[...all]/route.ts
-```
-
-Mount the Better Auth handler using the current Next.js integration, normally `toNextJsHandler(auth)`, and export only the supported `GET` and `POST` handlers.
-
-Verify:
-
-- Auth requests are same-origin and receive cookies.
-- `GET /api/auth/ok` works if that endpoint exists in the installed release.
-- Sign-in sets an HTTP-only session cookie.
-- Sign-out invalidates the session.
-- Unsupported methods do not expose stack traces.
-- Route errors do not include secrets or raw database errors.
-
-### 7.6 Session context
-
-Implement `getSessionContext()` on the server. It must:
-
-1. Read request headers using the current Next.js async API.
-2. Call Better Auth's server `getSession` API.
-3. Return an unauthenticated result without leaking whether a user exists.
-4. Query `organization_members` by the authenticated Better Auth user ID.
-5. Resolve the sole demo organization membership deterministically.
-6. Fail closed when there is no membership or when multiple memberships appear before organization switching exists.
-7. Return a typed context containing only the user summary, organization summary and role needed by server code.
-
-Do not place the full session, password account data, session token or database row in a client component prop.
-
-## 8. Authorization and Repositories
-
-### 8.1 Permission model
-
-Define role and permission types in `packages/auth/src/permissions.ts` or another package-owned module. Use explicit sets, not numeric role comparisons.
-
-Required role semantics:
-
-| Permission | Viewer | Analyst | Supervisor | Admin |
-|---|:---:|:---:|:---:|:---:|
-| `case.read` | Yes | Yes | Yes | Yes |
-| `case.create` | No | Yes | Yes | Yes |
-| `analysis.retry` | No | Yes | Yes | Yes |
-| `note.create` | No | Yes | Yes | Yes |
-| `report.export` | No | No | Yes | Yes |
-| `disposition.override` | No | No | Yes | Yes |
-| `audit.read` | No | No | Yes | Yes |
-| `member.manage` | No | No | No | Yes |
-| `settings.manage` | No | No | No | Yes |
-
-Only `case.read` is exercised by the Phase 2 pages. Defining the full matrix now prevents later routes from inventing inconsistent checks.
-
-Policy requirements:
-
-- Unknown role or permission fails closed.
-- The policy has unit tests for every matrix cell.
-- The client may use the same types for visual affordances, but server checks remain authoritative.
-- A role label is not a permission check.
-- Do not accept a role from a request body, URL, cookie or client state.
-
-### 8.2 Server guards
-
-Implement small composable guards:
-
-- `requireSession()` returns a valid authenticated user or redirects to `/sign-in` for page requests.
-- `requireWorkspaceContext()` returns user, organization and role or gives a safe denial.
-- `requirePermission(permission)` checks the resolved role before invoking a protected operation.
-- `getOptionalSession()` supports the sign-in page and root redirect without throwing.
-
-Use the current Next.js 16 conventions for `redirect`, `notFound` and any `forbidden` helper. Do not rely on a proxy/middleware cookie-presence check as the only protection. If a `src/proxy.ts` file is added for early redirects, repeat the full session and tenant checks in every page and route handler.
-
-### 8.3 Repository API
-
-Repositories must accept a trusted database-owned tenant scope, not a raw organization ID from a browser request. The scope may be derived from the richer auth context, but `@mailsentinel/db` must not import `@mailsentinel/auth`.
-
-Recommended shapes:
-
-```text
-listCases(scope, filters)
-getCase(scope, caseId)
-getMembershipForUser(userId)
-getOrganizationById(scope.organizationId)
+findCaseByIdempotencyKey(scope, key)
+findArtifactByHash(scope, sha256)
+createCaseIntake(scope, input)
+getCaseIngestionProjection(scope, caseId)
+appendAuditEvent(input)
+markAnalysisDeferred(scope, runId, failureCode, safeMessage)
 ```
 
 Repository rules:
 
-- Every tenant-owned query includes `organization_id = scope.organizationId`.
-- `getCase` applies the tenant predicate in the same query as the case ID predicate.
-- `listCases` never returns another organization's counts, rows or pagination metadata.
-- Case projections contain only safe metadata needed by the shell.
-- No repository has an unscoped `getCaseById` export available to web code.
-- A missing membership is not converted into a default organization.
-- No repository trusts an `organizationId` passed by a client.
-- Use parameterized Drizzle expressions only; do not concatenate SQL or identifiers from requests.
-- Return `null` for inaccessible/missing case details so the route can render one not-found outcome.
-- Keep write methods out of the Phase 2 repository surface except seed/test helpers.
+- `createCaseIntake` inserts case, artifact, run and initial audit events in one transaction.
+- The transaction verifies that `organization_id` on every inserted row matches the trusted scope.
+- The idempotency lookup and duplicate lookup always include the organization predicate.
+- `getCaseIngestionProjection` returns filename, byte size, SHA-256, artifact kind, run status and safe timestamps, but never `object_key`.
+- `appendAuditEvent` accepts a redacted metadata object and does not accept raw body/header parameters.
+- State updates use conditional predicates such as `WHERE id = run_id AND status = 'queued'` to prevent duplicate worker transitions.
+- No browser route can call an unscoped artifact or case lookup.
 
-### 8.4 Case number and ID rules
+## 6. Object Storage and Streaming Intake
 
-Phase 2 does not create cases, but define the future rules now:
+### 6.1 Storage adapter
 
-- IDs are opaque and generated server-side.
-- Case numbers are human-readable but unique only within an organization.
-- Case numbers are never used as authorization keys without a tenant predicate.
-- Subject, sender and filenames are not used in IDs or object keys.
-- No sequential database ID is exposed as a public case identifier.
+Add a server-only adapter under `apps/web/src/server/storage/` or a package with a real web consumer:
 
-## 9. Seed and Local Data
+- Use `@aws-sdk/client-s3` for S3-compatible commands.
+- Use `@aws-sdk/lib-storage` `Upload` for unknown-length streams and multipart handling.
+- Configure endpoint, region, bucket, access key, secret and path-style behavior from the existing server environment parser.
+- Keep one bounded client/pool in development; do not create a new client for every chunk.
+- Never expose credentials or signed URLs to client JavaScript.
+- Use `leavePartsOnError: false` and explicitly abort/clean incomplete multipart uploads.
 
-### 9.1 Seed contents
+### 6.2 Object key
 
-The idempotent local seed creates:
+Generate server-side IDs before writing bytes:
 
-- One synthetic organization, for example `demo-security-lab`.
-- One verified analyst user.
-- One verified supervisor user.
-- One analyst membership.
-- One supervisor membership.
-- No cases, artifacts, reports or audit rows.
-
-Test factories may create a second organization and synthetic cases in an isolated test database. Those records must never be part of the normal demo seed.
-
-### 9.2 Seed inputs
-
-Add ignored local seed variables only if the implementation needs them:
-
-```dotenv
-SEED_ORGANIZATION_NAME=MailSentinel Demo Lab
-SEED_ORGANIZATION_SLUG=demo-security-lab
-SEED_ANALYST_EMAIL=analyst@example.test
-SEED_ANALYST_PASSWORD=replace-with-local-demo-password
-SEED_SUPERVISOR_EMAIL=supervisor@example.test
-SEED_SUPERVISOR_PASSWORD=replace-with-local-demo-password
+```text
+organizations/{organizationId}/cases/{caseId}/artifacts/{artifactId}.eml
 ```
 
 Rules:
 
-- Use `.test` domains or another clearly synthetic namespace.
-- Require passwords to be supplied locally; do not commit defaults that can be used to access a deployed environment.
-- Enforce the password policy before calling Better Auth.
-- Never print passwords, password hashes, session tokens or full connection strings.
-- Never use real personal emails or production credentials.
-- Do not include seed passwords in README examples, CI output or screenshots.
+- Use opaque IDs only.
+- Do not use sender, subject, Message-ID, filename or hash as a path segment.
+- Store the key only in PostgreSQL and server-side logs when required for cleanup.
+- Do not return the key in web JSON or client props.
+- The bucket remains private; no public ACL, public policy or browser CORS access is needed for Phase 3.
 
-### 9.3 Idempotency behavior
+### 6.3 Stream and hash algorithm
 
-Run the seed inside deliberate transactions where possible:
+Implement one bounded pipeline with no unbounded `Buffer` accumulation:
 
-1. Validate all seed configuration before opening a write transaction.
-2. Upsert the organization by its synthetic slug.
-3. Find each user by exact synthetic email.
-4. Create missing users through the documented Better Auth server-side path.
-5. Verify existing seed users have the expected verified state; do not silently reset an unknown user's password.
-6. Upsert memberships by `(organization_id, user_id)`.
-7. Fail loudly if a configured demo email belongs to an unexpected tenant or role state.
-8. Commit only after all required users and memberships exist.
+1. Validate `Content-Length` when present; reject values over `MAX_EML_BYTES` before opening storage.
+2. Require a non-null request body.
+3. Create a SHA-256 hash and byte counter.
+4. Create a Node `PassThrough` or equivalent bounded stream connected to S3 `Upload`.
+5. Read the Next.js `Request.body` incrementally.
+6. For each chunk, reject a non-`Uint8Array` conversion failure safely.
+7. Add the chunk length to the counter before writing.
+8. If the count exceeds `MAX_EML_BYTES`, abort storage and stop consuming the request.
+9. Update the hash with the exact chunk bytes.
+10. Write the exact chunk to the storage stream with backpressure handling.
+11. End the stream only after the request body ends.
+12. Await S3 completion and calculate the lowercase SHA-256 digest.
+13. Verify the stored object `ContentLength` and stored SHA-256 metadata match the counter/digest.
+14. Reject zero-byte input.
+15. Keep the original object immutable after completion.
 
-Run the seed twice and confirm that it does not create duplicate users, organizations or memberships.
+If any stream, request or storage error occurs, destroy/abort all connected streams and make a best-effort cleanup attempt. Do not retry a partial upload blindly with a new case ID.
 
-## 10. Web Route and UI Plan
+### 6.4 Type and filename validation
 
-### 10.1 Route tree
+Client MIME is untrusted, but explicit unsupported values should be rejected. Accept only:
 
-Use route groups only for organization; keep public URLs exactly as required by `PLAN.md`:
+- `message/rfc822`.
+- `application/octet-stream`.
+- `text/plain` when the browser cannot identify an `.eml` file.
+
+The extension is required and case-insensitive:
+
+- Read `X-Original-Filename`.
+- Reject missing, empty, overlong or non-`.eml` values.
+- Normalize Unicode to a stable display form.
+- Remove control characters and path separators.
+- Keep only a sanitized display filename, capped at 255 characters.
+- Do not use the sanitized filename for object identity.
+
+Do not attempt to parse the email body here. A syntactically malformed but bounded `.eml` must be preserved for the parser phase to classify later.
+
+### 6.5 Request headers
+
+Require and validate:
+
+| Header | Rule |
+|---|---|
+| `Content-Type` | One accepted value; client value is not proof of message validity. |
+| `X-Original-Filename` | ASCII/Unicode display value, sanitized and bounded. |
+| `Idempotency-Key` | Opaque 16-128 character value, no control characters, required for POST. |
+| `X-Allow-Duplicate` | Exact `true` only on an explicit confirmation retry; never an authorization mechanism. |
+| `Origin` | Must match a configured trusted web origin for cookie-authenticated mutation. |
+| `X-Request-ID` | Optional bounded caller correlation ID; otherwise generate a server request ID. |
+
+Do not accept organization ID, user ID, role, object key, artifact ID, case ID or SHA-256 from the browser as authoritative input.
+
+## 7. Web API and Server Flow
+
+### 7.1 `POST /api/cases`
+
+Add a Node-runtime route handler at:
 
 ```text
-apps/web/src/app/
-├── page.tsx
-├── (auth)/
-│   ├── sign-in/
-│   │   └── page.tsx
-│   └── session-expired/
-│       └── page.tsx
-├── (protected)/
-│   ├── layout.tsx
-│   ├── dashboard/
-│   │   └── page.tsx
-│   └── cases/
-│       ├── page.tsx
-│       └── [caseId]/
-│           └── page.tsx
-└── api/
-    └── auth/
-        └── [...all]/
-            └── route.ts
+apps/web/src/app/api/cases/route.ts
 ```
 
-Confirm the installed Next.js route-segment and async-params conventions before implementing dynamic pages.
+The handler must:
 
-### 10.2 Root behavior
+1. Generate or validate a request ID.
+2. Validate the `Origin` header against the configured application origin.
+3. Resolve the Phase 2 workspace context from the session.
+4. Require `case.create` permission.
+5. Validate content type, filename, idempotency key and declared content length.
+6. Check for an existing case with the same tenant-scoped idempotency key.
+7. Stream/hash/store the bytes.
+8. Check for a same-organization duplicate hash.
+9. Remove a temporary object and return `409` when confirmation is required.
+10. Create case/artifact/run/audit rows transactionally.
+11. Call the internal analyzer intake client with server credentials.
+12. Conditionally mark the run/case deferred if intake fails.
+13. Return a minimized response.
 
-Replace the setup placeholder at `/` with a server-side redirect:
+Do not call `request.formData()` for the file body if it buffers the full payload. Use the installed Next.js Node-runtime streaming conventions.
 
-- Valid session and membership -> `/dashboard`.
-- No valid session -> `/sign-in`.
-- Valid session without membership -> safe access-denied state, not a fabricated organization.
+### 7.2 Success response
 
-Do not render a public dashboard preview that accidentally reveals case counts.
+Return `202 Accepted` when the analyzer intake is accepted:
 
-### 10.3 Sign-in page
+```json
+{
+  "caseId": "case_...",
+  "caseNumber": "MS-000001",
+  "analysisRunId": "run_...",
+  "status": "queued",
+  "artifact": {
+    "kind": "original_eml",
+    "sha256": "...",
+    "byteSize": 24831,
+    "contentType": "message/rfc822",
+    "originalFilename": "message.eml"
+  },
+  "requestId": "req_..."
+}
+```
 
-Implement a focused email/password page using existing UI primitives where they provide real value.
+Return `200 OK` with the same minimized result and an `Idempotent-Replay: true` header when the idempotency key already completed. Do not write a second object or audit event for an idempotent replay.
 
-Required behavior:
+### 7.3 Error responses
 
-- Email and password fields with labels, autocomplete attributes and keyboard support.
-- Submit loading state and disabled duplicate submission.
-- Client-side required-field validation for fast feedback.
-- Call Better Auth's email sign-in method through the browser-safe client.
-- On success, navigate to the fixed `/dashboard` path and refresh server-rendered session state.
-- On failure, show a generic message such as "Unable to sign in with those credentials."
-- Do not distinguish unknown email, wrong password, disabled account or missing membership in the public error text.
-- Do not show a sign-up link.
-- Do not include password reset or email verification controls in this phase.
-- Do not log form values in the browser or server.
+Use safe machine-readable bodies:
 
-The page must retain the current repository's accessible focus styles and visual language rather than introducing a separate design system.
+```json
+{
+  "code": "UPLOAD_TOO_LARGE",
+  "message": "The email file exceeds the configured size limit.",
+  "requestId": "req_..."
+}
+```
 
-### 10.4 Protected layout
+Required mappings:
 
-The protected layout must:
+| Status | Codes/examples | Behavior |
+|---:|---|---|
+| `400` | `INVALID_FILENAME`, `INVALID_CONTENT_TYPE`, `INVALID_IDEMPOTENCY_KEY`, `EMPTY_UPLOAD` | No case or artifact rows. |
+| `401` | `AUTH_REQUIRED` | Do not reveal case or organization state. |
+| `403` | `UPLOAD_NOT_ALLOWED`, `ORIGIN_NOT_ALLOWED` | Do not reveal tenant data. |
+| `404` | Not used for intake authorization failures unless a future route needs it | Do not use it to reveal duplicate state. |
+| `409` | `DUPLICATE_ARTIFACT`, `IDEMPOTENCY_CONFLICT` | Same-tenant duplicate details only; explicit confirmation is required for a new case. |
+| `413` | `UPLOAD_TOO_LARGE` | Abort/clean storage. |
+| `500` | `INTAKE_PERSISTENCE_FAILED` | Return no raw database error. |
+| `503` | `STORAGE_UNAVAILABLE`, `ANALYSIS_DEFERRED`, `QUEUE_UNAVAILABLE` | Preserve committed evidence and include the case ID only when it exists. |
 
-- Resolve the server session and workspace context before rendering.
-- Redirect unauthenticated requests to `/sign-in`.
-- Show the signed-in user's safe display name/email representation.
-- Show the active demo organization name and role label.
-- Provide navigation to Dashboard and Cases.
-- Provide a sign-out action that clears the session and returns to `/sign-in`.
-- Avoid passing the session token or full auth object to client components.
-- Render a safe error state if the user has no membership.
+Never return a Python traceback, S3 response, database URL, service token, raw provider response or email content.
 
-### 10.5 Dashboard shell
+### 7.4 Duplicate and idempotency behavior
 
-The dashboard is an honest product shell, not a simulated analysis dashboard.
+#### Idempotency lookup before storage
 
-Show:
+- Resolve the tenant from the session.
+- Look up `(organization_id, idempotency_key)`.
+- If found and the request identity is compatible, return the existing case projection.
+- If found but the request attempts to change the file, return `409 IDEMPOTENCY_CONFLICT`.
+- Never look up an idempotency key across all organizations.
 
-- A short explanation of the MailSentinel analyst workspace.
-- The current organization and role.
-- Case count of zero from a tenant-scoped query.
-- A clear "No cases yet" state.
-- A statement that evidence ingestion will be added in the next phase.
+#### Duplicate hash lookup after storage
 
-Do not show fabricated risk distributions, provider health, map data or analysis statuses.
+- Compute the new object's hash first.
+- Query `evidence_artifacts` by `(organization_id, sha256)`.
+- If no match exists, continue.
+- If a match exists and `X-Allow-Duplicate` is not exact `true`, delete the new temporary object and return `409 DUPLICATE_ARTIFACT` with the existing case's safe ID/number.
+- If confirmation is present, create a new case with a new case ID, artifact ID and analysis run ID.
+- Never reveal a duplicate artifact in a different organization.
 
-### 10.6 Case queue
+### 7.5 Analyzer client
 
-`/cases` must:
+Create a server-only client under `apps/web/src/server/analyzer-client.ts`:
 
-- Require a valid session and membership.
-- Adapt the authenticated workspace context to a `TenantScope`, then query through `listCases(scope, filters)`.
-- Render an accessible table when test/demo data exists.
-- Render a deliberate empty state when no cases exist.
-- Keep future filters visually absent or disabled with truthful copy; do not build non-functional filter controls.
-- Display only safe case metadata.
-- Avoid organization IDs, raw database errors and hidden cross-tenant counts.
+- Use `ANALYZER_INTERNAL_URL` and `ANALYZER_SERVICE_TOKEN` from server-only configuration.
+- Send a short timeout, for example 3 seconds for intake acceptance.
+- Send `Authorization: Bearer <token>` or the single header selected in ADR 0005.
+- Send request ID for correlation.
+- Parse only the documented response contract.
+- Map timeout, connection reset and `5xx` to `QUEUE_UNAVAILABLE`.
+- Map safe `4xx` contract responses without exposing the response body.
+- Never retry the intake automatically with a new run ID.
+- Do not log the token or request body.
 
-### 10.7 Case detail
+## 8. Analyzer Intake and Queue
 
-`/cases/[caseId]` must:
+### 8.1 Python workspace additions
 
-- Require a valid session and membership.
-- Call the tenant-scoped `getCase` repository.
-- Render one not-found result for an invalid ID and an existing case owned by another organization.
-- Show the case number, title, status and priority when a synthetic case exists.
-- Show a clear "Analysis not available yet" state because Phase 2 does not implement ingestion.
-- Avoid raw email content, object keys, provider results, verdicts or attachment data.
+Add only the Phase 3 dependencies to `apps/analyzer`:
 
-### 10.8 UI safety and accessibility
+- Dramatiq with Redis support.
+- A Redis client if not supplied by the Dramatiq extra.
+- `psycopg` with the binary extra for PostgreSQL access.
+- An S3-compatible client such as `boto3` for worker object verification.
 
-- Never use color alone for role, status or access state.
-- Use text labels and accessible names for all actions.
-- Escape all database-backed strings through normal React rendering.
-- Do not use `dangerouslySetInnerHTML`.
-- Preserve keyboard navigation and visible focus.
-- Test at mobile, tablet and desktop widths.
-- Provide loading, empty, access-denied and not-found states.
-- Do not expose an organization selector before server-side multi-organization rules exist.
+Use `uv add` or the repository's equivalent so `pyproject.toml` and `uv.lock` remain synchronized. Do not add parser, DNS, GeoIP, reputation or ML dependencies yet.
 
-## 11. Testing Strategy
+### 8.2 Internal request contract
 
-### 11.1 Unit tests
+Define Pydantic models in `apps/analyzer/app/api/analyses.py`:
 
-Test the role policy exhaustively:
+```json
+{
+  "caseId": "case_...",
+  "organizationId": "org_...",
+  "analysisRunId": "run_...",
+  "artifact": {
+    "objectKey": "organizations/org_.../cases/case_.../artifacts/art_....eml",
+    "sha256": "64 lowercase hex characters",
+    "byteSize": 24831
+  },
+  "requestedAt": "2026-08-29T00:00:00Z",
+  "requestId": "req_..."
+}
+```
 
-- Every role/permission pair in the matrix.
-- Unknown role fails closed.
-- Unknown permission fails closed.
-- A viewer cannot inherit analyst permissions accidentally.
-- Supervisor permissions do not imply admin member management.
-- Policy helpers do not accept a client-supplied role.
+Rules:
 
-Test input and projection helpers:
+- Use Pydantic aliases matching the JSON contract and Python names internally.
+- Bound string lengths and reject control characters.
+- Validate SHA-256 shape and non-negative byte size.
+- Validate timestamp timezone awareness.
+- Do not accept a browser-originated request; the route is service-only.
+- Export deterministic OpenAPI after the endpoint is implemented.
 
-- Organization slug validation.
-- Role parsing.
-- Case ID format validation.
-- Safe case projection excludes future sensitive fields.
-- Generic auth error mapping does not reveal account state.
+Return:
 
-### 11.2 Database integration tests
+```json
+{
+  "analysisRunId": "run_...",
+  "status": "queued",
+  "acceptedAt": "2026-08-29T00:00:00Z",
+  "requestId": "req_..."
+}
+```
 
-Run against a disposable PostgreSQL database with migrations applied. Do not substitute SQLite for PostgreSQL behavior.
+### 8.3 Service authentication
 
-Test:
+Implement a FastAPI dependency or middleware for the intake route:
 
-- Clean migration creates the expected Better Auth and application tables.
-- Migration is idempotent.
-- Organization slug uniqueness is enforced.
-- Duplicate organization membership is rejected or safely upserted only by the seed path.
-- Invalid membership roles are rejected.
-- Foreign keys prevent orphan memberships and cases.
-- Case number uniqueness is scoped to an organization.
-- Queue indexes and status constraints exist where practical.
-- Seed creates the expected users, organization and memberships.
-- Seed is idempotent and does not create cases.
+1. Read the selected authorization header.
+2. Reject missing or malformed credentials with `401`.
+3. Compare the supplied token and configured token using constant-time comparison.
+4. Never include the token in an exception, log, metric or response.
+5. Do not accept organization ID, user ID or role from the authorization header.
+6. Keep the endpoint on the internal network in Compose/deployment.
 
-### 11.3 Tenant-isolation tests
+The service token authenticates the web service, not an analyst. The web service has already enforced the analyst role.
 
-Create two organizations and two users in the test database. Create synthetic case metadata in both organizations. Prove:
+### 8.4 Intake relation validation
 
-- User A lists only organization A cases.
-- User B lists only organization B cases.
-- User A cannot retrieve a known organization B case ID.
-- User A cannot retrieve organization B data by changing a requested organization ID.
-- A missing case and an inaccessible case produce the same repository result.
-- A user with no membership receives no default organization.
-- A user with multiple memberships fails safely until organization selection exists.
-- Case counts and pagination metadata are tenant-scoped.
-- Role changes are read from the database and are not trusted from a stale browser value.
+Before enqueueing, the analyzer must verify through PostgreSQL that:
 
-### 11.4 Auth integration tests
+- `analysis_run_id` exists.
+- The run belongs to `organization_id`.
+- The run belongs to `case_id`.
+- The case belongs to `organization_id`.
+- An `original_eml` artifact exists for the case and organization.
+- Its object key, SHA-256 and byte size exactly match the request.
+- The run is still `queued`.
 
-Test the mounted auth route or a supported in-process handler:
+Return a safe `409` for a stale/duplicate run and a safe `404` or `400` for an invalid relation without confirming inaccessible tenant data.
 
-- Valid seeded analyst credentials create a session.
-- Valid seeded supervisor credentials create a session.
-- Invalid credentials receive a generic failure.
-- Public sign-up is rejected by the mounted configuration.
-- Sign-out invalidates the session.
-- Expired or malformed session cookies do not authorize a page.
-- Session cookies are HTTP-only and same-site; production secure behavior is tested with the appropriate environment.
-- Auth route errors contain a request-safe message and no stack trace.
-- No secret, password or token is written to test output.
+### 8.5 Dramatiq broker
 
-### 11.5 Browser tests
+Create a small broker module, for example `apps/analyzer/app/tasks/broker.py`:
 
-Add the first Playwright smoke flow now because authentication and protected navigation are browser behavior:
+- Read `REDIS_URL` from validated settings.
+- Configure `RedisBroker` with a stable queue name such as `mailsentinel.analysis`.
+- Add bounded retry middleware with exponential backoff and jitter.
+- Cap retries for storage/temporary database failures.
+- Do not retry permanent request validation or integrity failures indefinitely.
+- Keep broker initialization import-safe for unit tests.
+- Expose a health/readiness check that can distinguish Redis failure from provider failure.
 
-1. Start PostgreSQL, apply migrations and seed synthetic users.
-2. Start the Next.js app with test configuration.
-3. Visit `/dashboard` without a session and confirm redirect to `/sign-in`.
-4. Sign in as the seeded analyst.
-5. Confirm `/dashboard` shows the demo organization and analyst role.
-6. Confirm `/cases` shows the honest empty state.
-7. Navigate to a missing case ID and confirm a not-found result.
-8. Sign out and confirm protected routes redirect again.
-9. Attempt a viewer flow using a test-created viewer account and confirm read-only behavior where applicable.
+### 8.6 Idempotent actor
 
-Do not put real credentials in Playwright source. Load synthetic values from ignored test environment variables.
+Create `apps/analyzer/app/tasks/actors.py` with one Phase 3 actor:
 
-### 11.6 Security regression tests
+```text
+process_analysis(organization_id, case_id, analysis_run_id, artifact_reference, request_id)
+```
+
+Actor behavior:
+
+1. Load the run and relation by all three IDs.
+2. Conditionally claim the queued run; if another worker already claimed/finished it, return without duplicate writes.
+3. Retrieve the private object using analyzer credentials.
+4. Stream it while recalculating SHA-256 and byte size.
+5. Compare both against the database artifact metadata.
+6. On mismatch, conditionally mark run/case `failed` with `ARTIFACT_INTEGRITY_MISMATCH` and append a service audit event.
+7. On success, do not parse; conditionally mark run/case `analysis_deferred` with `PARSER_NOT_AVAILABLE` and append a service audit event.
+8. Preserve the original object without overwriting it.
+9. Log only run ID, case ID, organization ID, byte count, duration and safe outcome.
+
+If the worker is not running, the run remains `queued` and the UI must display that it is waiting. If the worker is running, `analysis_deferred` is the truthful terminal Phase 3 state.
+
+### 8.7 FastAPI route
+
+Add `POST /v1/analyses` to the analyzer app:
+
+- Protect it with the service-token dependency.
+- Validate the Pydantic request.
+- Validate the database relation.
+- Send exactly one Dramatiq message for the run.
+- Return `202` with the response contract.
+- Include a request ID in response headers and body.
+- Return safe `409`, `401`, `403`, `422` or `503` errors.
+- Do not expose the route to the public browser network.
+
+The existing `/health/live` and `/health/ready` endpoints must continue to work. Readiness may fail for a required Redis/DB dependency, but a future external provider outage must not affect readiness.
+
+## 9. Web Upload and Status UI
+
+### 9.1 Routes
+
+Add:
+
+```text
+apps/web/src/app/(protected)/cases/new/page.tsx
+apps/web/src/app/api/cases/route.ts
+apps/web/src/app/api/cases/[caseId]/route.ts
+apps/web/src/app/api/cases/[caseId]/status/route.ts  # optional if projection route is kept separate
+```
+
+Use the existing protected layout and `requireWorkspaceContext()`.
+
+The case detail route remains `/cases/[caseId]`. Do not expose an artifact download route in this phase.
+
+### 9.2 New-case page
+
+The server page must:
+
+- Require `case.create`.
+- Pass only the non-secret maximum byte limit to the client form.
+- Explain accepted `.eml` files, the maximum size and synthetic-data privacy rules.
+- Show the current organization name without accepting it as input.
+- Avoid rendering any existing message content.
+
+The client upload form must:
+
+- Accept one `.eml` file.
+- Reject an incorrect extension, empty file or local size over the limit before sending.
+- Generate a new idempotency key for a new attempt.
+- Use `XMLHttpRequest` or another supported browser API when upload progress is required.
+- Send the exact file bytes as the raw request body.
+- Send `X-Original-Filename`, accepted `Content-Type` and `Idempotency-Key`.
+- Display byte progress without reading the file into a second full buffer.
+- Disable duplicate submission while the request is active.
+- Parse only safe error codes.
+- On `202`, navigate to `/cases/{caseId}`.
+- On `503` with a preserved case ID, navigate to that case and show deferred state.
+- On `409 DUPLICATE_ARTIFACT`, show the existing safe case reference and require an explicit confirmation before retrying with `X-Allow-Duplicate: true`.
+- Keep the same idempotency key for the duplicate-confirmation retry.
+- Never log file bytes, filename-derived content beyond the displayed sanitized name, credentials or response bodies.
+
+### 9.3 Case queue
+
+Update `/cases`:
+
+- Show a `New case` link only for users with `case.create`.
+- Keep all rows from `listCases` tenant-scoped.
+- Display queued, deferred and failed labels with text and icons, not color alone.
+- Do not show risk, verdict or analysis observations.
+- Show the safe original filename and receive time only after the upload has been persisted.
+- Keep empty-state copy truthful when there are no cases.
+
+### 9.4 Case detail projection
+
+Extend the page/server endpoint to show:
+
+- Case number and title.
+- Status and status explanation.
+- Original sanitized filename.
+- Exact byte size.
+- SHA-256 digest in a copyable but non-sensitive metadata block.
+- Artifact kind `original_eml`.
+- Receive timestamp.
+- Analysis run status and safe failure/deferred code.
+- A clear note that forensic parsing has not started or is deferred.
+
+Do not show:
+
+- Object storage keys.
+- Signed URLs.
+- Raw email body or full headers.
+- Attachment bytes.
+- A verdict or risk score.
+- Provider data.
+
+### 9.5 Status polling
+
+Implement a client status component with a server-rendered initial projection:
+
+- Poll the minimized case endpoint every 2-3 seconds while status is `queued`.
+- Stop polling for `analysis_deferred` and `failed` in Phase 3.
+- Stop polling for all later terminal statuses when Phase 4 adds them.
+- Back off after repeated network errors.
+- Keep the last known state visible.
+- Avoid polling when the document is hidden.
+- Never poll an endpoint that returns raw evidence.
+- Do not create a `case.viewed` audit event for every poll.
+
+## 10. Audit, Logging and Security Controls
+
+### 10.1 Audit events
+
+Append these events with redacted metadata:
+
+| Event | Actor | When |
+|---|---|---|
+| `case.created` | user | Case transaction commits. |
+| `evidence.uploaded` | user | Original artifact metadata commits. |
+| `analysis.queued` | service or user | Analyzer accepts the intake. |
+| `analysis.deferred` | service | Analyzer/queue/parser-unavailable path occurs. |
+| `analysis.failed` | service | Integrity or permanent worker failure occurs. |
+| `case.viewed` | user | Authorized detail page performs its initial data load. |
+
+Metadata may contain safe IDs, status, byte count, hash, mode and duration. It must not contain raw bytes, full headers, body text, passwords, tokens or unredacted IP forwarding chains.
+
+### 10.2 Origin and CSRF protection
+
+The upload route is a cookie-authenticated mutation, so do not rely solely on Better Auth's auth-route CSRF checks:
+
+- Require a same-origin `Origin` for browser upload requests.
+- Compare against the configured trusted origin, not a request-supplied host.
+- Reject unexpected origins before reading/storing the body.
+- Do not disable Better Auth CSRF or origin checks.
+- Keep the service-token analyzer route separate from browser cookie auth.
+
+### 10.3 SSRF and path controls
+
+- The upload route contacts only the configured S3/MinIO endpoint and analyzer URL.
+- It never contacts a URL from the email body; email body parsing is deferred.
+- The analyzer's S3 endpoint comes from server configuration, not a request field.
+- Reject object keys supplied by the browser.
+- Sanitize the display filename and never concatenate it into a filesystem or object path.
+- Do not add remote image, URL preview or attachment rendering behavior.
+
+### 10.4 Logging policy
+
+Allowed fields:
+
+- request ID;
+- organization ID;
+- case ID;
+- analysis run ID;
+- stage;
+- byte count;
+- duration;
+- provider/queue status;
+- safe error code.
+
+Forbidden fields:
+
+- raw request body;
+- full headers;
+- original object key in user-facing logs;
+- passwords, secrets or service tokens;
+- raw S3/Redis/database error payloads;
+- complete filenames when they may contain personal data;
+- email addresses unless the later forensic display policy permits them.
+
+## 11. Contracts and Generated Types
+
+### 11.1 Analyzer OpenAPI
+
+Make FastAPI the source of truth:
+
+1. Define Pydantic request/response/error models.
+2. Export a deterministic `openapi.json`.
+3. Add `apps/analyzer` script `contracts:export`.
+4. Create `packages/contracts` only if the generated client has a real web consumer.
+5. Generate TypeScript types from the exported OpenAPI document.
+6. Make the web analyzer client use generated response/request types.
+7. Add CI drift detection by regenerating and failing on a diff.
+
+Do not manually duplicate the analyzer response shape in a web-only interface.
+
+### 11.2 Contract error codes
+
+Define a shared list of stable codes for:
+
+- invalid service credentials;
+- invalid request relation;
+- duplicate/stale run;
+- queue unavailable;
+- artifact integrity mismatch;
+- parser unavailable;
+- storage unavailable.
+
+Error messages can change for UX; codes are the machine contract. All messages must be safe for browser display.
+
+## 12. Testing Strategy
+
+### 12.1 TypeScript unit tests
+
+Add tests for:
+
+- filename normalization and path-separator removal;
+- `.eml` extension validation;
+- accepted/rejected content types;
+- idempotency-key validation;
+- maximum byte and content-length validation;
+- origin validation;
+- case-number/title safe projection;
+- duplicate-response parsing;
+- analyzer timeout/error mapping;
+- conditional state transition helpers;
+- audit metadata redaction;
+- permission checks for viewer/analyst/supervisor/admin.
+
+Use synthetic byte arrays only. Do not put raw private-looking email content in test output.
+
+### 12.2 Object-storage integration tests
+
+With MinIO or an isolated S3-compatible test service:
+
+- Upload a known synthetic byte stream.
+- Verify the object exists in the private bucket.
+- Verify `ContentLength` matches the counted bytes.
+- Re-download the object as a stream and calculate SHA-256.
+- Verify the re-downloaded hash matches PostgreSQL metadata.
+- Verify the object key contains only the organization, case and artifact IDs.
+- Verify no public bucket access is enabled.
+- Force a stream failure and confirm multipart cleanup is attempted.
+- Send an over-limit stream and confirm no complete artifact row is written.
+
+### 12.3 Database integration tests
+
+Against PostgreSQL 17 with migrations applied:
+
+- New artifact/run/audit tables exist.
+- Existing Phase 2 data remains readable.
+- Migration is repeatable.
+- Idempotency key is unique within an organization and can repeat across organizations.
+- Same hash can exist in different organizations.
+- Same-organization duplicate lookup returns only that organization's artifact.
+- A case/artifact/run transaction rolls back together.
+- A committed case remains when queue metadata is later deferred.
+- Audit events can be inserted but not updated/deleted through package APIs.
+- Conditional run transitions prevent duplicate deferred/failed writes.
+- Cross-tenant artifact, run and audit reads return no rows.
+
+### 12.4 Web route integration tests
+
+Mock or use local implementations for S3 and analyzer intake. Test:
+
+- Unauthenticated upload is rejected before reading the body.
+- Viewer upload is rejected before reading the body.
+- Analyst upload creates one case, artifact, run and initial audit events.
+- Supervisor/admin upload is allowed.
+- Missing filename, wrong extension and unsupported type return `400`.
+- Declared oversized content returns `413` before storage.
+- Chunked over-limit content aborts storage and writes no committed artifact.
+- Empty content returns `400`.
+- S3 failure returns safe `503` and no committed metadata.
+- Database failure triggers best-effort object cleanup.
+- Analyzer `202` leaves status `queued`.
+- Analyzer timeout commits evidence and changes status to `analysis_deferred`.
+- Redis/queue failure commits evidence and changes status to `analysis_deferred`.
+- Duplicate hash without confirmation returns `409` and cleans temporary storage.
+- Duplicate hash with confirmation creates a separate case in the same organization.
+- The same idempotency key returns the original case without a second object.
+- The same idempotency key with different bytes returns `409`.
+- Origin mismatch is rejected before storage.
+- Response never contains the object key or raw email bytes.
+
+### 12.5 Analyzer unit/integration tests
+
+Test with fake Redis, PostgreSQL and S3 adapters where appropriate:
+
+- Missing/bad service token returns `401`.
+- Valid token is accepted with constant-time comparison path.
+- Forged organization/case/run/artifact relationship is rejected.
+- Valid relation enqueues one message.
+- Duplicate intake does not enqueue a new run.
+- Actor ignores a non-queued run.
+- Actor detects object size mismatch.
+- Actor detects SHA-256 mismatch.
+- Actor marks integrity failure safely.
+- Actor marks a verified object `analysis_deferred` with `PARSER_NOT_AVAILABLE`.
+- Actor retry behavior is bounded.
+- Logs contain IDs and counts but not message content or credentials.
+
+### 12.6 End-to-end tests
+
+Extend Playwright with synthetic credentials and a synthetic `.eml` fixture:
+
+1. Sign in as analyst.
+2. Open `/cases/new`.
+3. Confirm the upload limit and privacy notice are visible.
+4. Upload the fixture and observe progress.
+5. Confirm navigation to a new case.
+6. Confirm the case displays a SHA-256 and byte size.
+7. Confirm queued state while the worker is unavailable or deferred state when the safe worker path runs.
+8. Confirm no raw message body is rendered.
+9. Repeat the same idempotency request and confirm no duplicate case.
+10. Upload the same fixture again and confirm the duplicate warning.
+11. Confirm a duplicate can be explicitly confirmed within the same organization.
+12. Sign in as viewer and confirm the new-case action/upload is unavailable.
+13. Attempt an inaccessible case/artifact ID and confirm safe not-found behavior.
+14. Test analyzer/queue failure copy without exposing implementation details.
+
+### 12.7 Security and resource tests
 
 Include:
 
-- Direct access to all protected paths without a session.
-- Cross-tenant case ID access.
-- Organization ID tampering if any request accepts that field.
-- Role tampering in a cookie, form or client payload.
-- SQL metacharacters in case IDs and slugs.
-- Script-like strings in organization names, case titles and user display names.
-- Session fixation or reuse after sign-out.
-- Missing membership.
-- Multiple memberships before an active-organization selector exists.
-- Public sign-up endpoint exposure.
-- Secret-like environment values accidentally included in client bundles.
+- 25 MiB boundary and 25 MiB + 1 byte.
+- Missing or contradictory `Content-Length`.
+- Slow/chunked body within timeout policy.
+- Malicious filename with path traversal, null/control characters and very long Unicode.
+- Unsupported content type with `.eml` extension.
+- Invalid/missing origin.
+- Invalid/oversized idempotency key.
+- Duplicate delivery of the same analyzer request.
+- Forged service token.
+- Forged organization/case/artifact IDs.
+- Cross-tenant duplicate hash and case ID checks.
+- Client disconnect after upload commit.
+- S3/Redis/PostgreSQL outage.
+- Log capture proving raw body/header values are absent.
 
-## 12. CI and Developer Operations
+## 13. Environment and Infrastructure Changes
 
-### 12.1 Root scripts and Turbo
+### 13.1 Web environment
 
-Add package scripts without breaking the existing setup commands:
+Retain the existing values and add/validate only what Phase 3 needs:
 
-- `db:generate` delegates to `@mailsentinel/db` and is explicit.
-- `db:migrate` delegates to `@mailsentinel/db` and is uncached.
-- `db:seed` delegates to `@mailsentinel/db` and is explicit.
-- `db:check` verifies the local schema/connection.
+```dotenv
+DATABASE_URL=postgresql://mailsentinel:replace-me@localhost:5432/mailsentinel
+BETTER_AUTH_SECRET=replace-with-at-least-32-random-bytes
+BETTER_AUTH_URL=http://localhost:3000
+BETTER_AUTH_TRUSTED_ORIGINS=http://localhost:3000
+ANALYZER_INTERNAL_URL=http://localhost:8000
+ANALYZER_SERVICE_TOKEN=replace-with-local-service-token
+S3_ENDPOINT=http://localhost:9000
+S3_REGION=us-east-1
+S3_BUCKET=mailsentinel-evidence
+S3_ACCESS_KEY_ID=replace-me
+S3_SECRET_ACCESS_KEY=replace-me
+S3_FORCE_PATH_STYLE=true
+MAX_EML_BYTES=26214400
+UPLOAD_TIMEOUT_MS=120000
+ANALYZER_REQUEST_TIMEOUT_MS=3000
+RETENTION_DAYS=90
+APP_ENV=development
+```
 
-Update Turbo only where needed:
+Rules:
 
-- Make `@mailsentinel/auth` and `@mailsentinel/db` visible to dependent typecheck/build tasks.
-- Include schema files and migration files in relevant task inputs.
-- Keep database mutation tasks uncached.
-- Ensure `pnpm test` includes package and web tests.
-- Ensure package scripts do not load production environment files during typecheck or unit tests.
+- `MAX_EML_BYTES` must be a positive bounded integer; do not allow an unlimited setting.
+- `UPLOAD_TIMEOUT_MS` must prevent a body from holding a worker indefinitely.
+- `ANALYZER_REQUEST_TIMEOUT_MS` applies only to intake acceptance, not analysis duration.
+- No new value may use `NEXT_PUBLIC_` unless it is intentionally non-secret, such as a displayed size limit passed by a server component.
 
-### 12.2 CI database service
+### 13.2 Analyzer environment
 
-Update CI so database-backed tests run against disposable PostgreSQL:
+Retain existing DB, Redis, S3 and token values. Add queue settings:
 
-1. Start a PostgreSQL 17 service or an isolated Compose service.
-2. Set synthetic test-only `DATABASE_URL` values.
-3. Install JavaScript dependencies with the frozen lockfile.
-4. Apply migrations using the same `db:migrate` command used locally.
-5. Run unit and database integration tests.
-6. Run browser tests in the configured test project if enabled.
-7. Run lint, typecheck, build and formatting checks.
-8. Tear down disposable state automatically.
+```dotenv
+DATABASE_URL=postgresql://mailsentinel:replace-me@localhost:5432/mailsentinel
+REDIS_URL=redis://:replace-me@localhost:6379/0
+S3_ENDPOINT=http://localhost:9000
+S3_REGION=us-east-1
+S3_BUCKET=mailsentinel-evidence
+S3_ACCESS_KEY_ID=replace-me
+S3_SECRET_ACCESS_KEY=replace-me
+S3_FORCE_PATH_STYLE=true
+ANALYZER_SERVICE_TOKEN=replace-with-local-service-token
+ANALYZER_PORT=8000
+ANALYSIS_VERSION=prototype-1
+DRAMATIQ_QUEUE_NAME=mailsentinel.analysis
+DRAMATIQ_MAX_RETRIES=3
+DRAMATIQ_MIN_BACKOFF_MS=1000
+DRAMATIQ_MAX_BACKOFF_MS=30000
+MAX_EML_BYTES=26214400
+ENRICHMENT_MODE=offline
+APP_ENV=development
+```
 
-CI must not:
+Do not put the analyzer service token in a browser environment or expose FastAPI publicly.
 
-- Connect to the demo evidence bucket.
-- Use live provider keys.
-- Print test passwords or database secrets.
-- Run the local demo seed with credentials embedded in workflow YAML.
-- Treat a migration generation diff as an implicit migration application.
+### 13.3 Compose
 
-### 12.3 Documentation updates
+Update the existing `analyzer` and `worker` profile configuration:
 
-Update `README.md` and `docs/development-setup.md` with:
+- Include the updated `uv.lock` dependencies in the analyzer image.
+- Pass the S3, PostgreSQL, Redis and service-token values to both services.
+- Ensure `minio-init` completes before any upload/worker integration test.
+- Keep analyzer and worker on the private Compose network.
+- Keep host bindings local-only.
+- Make the worker command run the Dramatiq worker, not the setup placeholder.
+- Add health/readiness checks that do not require a forensic job to exist.
+- Do not make MinIO public.
 
-- How to add the Phase 2 environment values.
-- How to apply migrations.
-- How to run the idempotent demo seed.
-- How to set synthetic seed passwords without committing them.
-- Demo account emails, but never demo passwords.
-- How to run database and browser tests.
-- A warning that sign-up, upload and analysis are intentionally unavailable.
-- A note that the current phase uses one server-resolved organization.
-
-Add `packages/db/README.md` and `packages/auth/README.md` with ownership boundaries and the relevant commands.
-
-## 13. Ordered Execution Plan
-
-Do not start the next workstream until the previous workstream's exit criteria pass.
-
-### Workstream A - Freeze data and auth decisions
-
-Tasks:
-
-- [ ] Run the preflight checks.
-- [ ] Record the driver, session-storage and RBAC decisions in ADR 0004.
-- [ ] Read the installed Better Auth and Next.js guides.
-- [ ] Confirm the exact Better Auth package and CLI versions to pin.
-- [ ] Confirm the app-owned membership decision is not being mixed with the organization plugin.
-- [ ] Confirm the seed-only user creation path.
-
-Exit criteria:
-
-- The schema owner, auth owner and tenant authorization owner are unambiguous.
-- No implementation depends on an unresolved plugin or migration choice.
-
-### Workstream B - Create `@mailsentinel/db`
-
-Tasks:
-
-- [ ] Add package metadata and scripts.
-- [ ] Add the PostgreSQL pool and Drizzle client with safe development lifecycle behavior.
-- [ ] Add package-local environment validation for `DATABASE_URL`.
-- [ ] Add tenancy and case schema files.
-- [ ] Generate and review Better Auth schema.
-- [ ] Export the combined schema.
-- [ ] Add Drizzle config and migration commands.
-- [ ] Generate the first migration.
-- [ ] Apply it to a clean local database.
-- [ ] Add database constraints and repository test helpers.
-
-Exit criteria:
-
-- Clean migration creates all Phase 2 tables.
-- The db package typechecks and its migration tests pass.
-- No upload, evidence or analysis table is falsely represented as populated.
-
-### Workstream C - Configure Better Auth
-
-Tasks:
-
-- [ ] Add `@mailsentinel/auth` package metadata and dependencies.
-- [ ] Implement validated server environment access.
-- [ ] Implement the server Better Auth instance.
-- [ ] Implement the browser-safe auth client.
-- [ ] Add typed session exports.
-- [ ] Add the Next.js auth route handler.
-- [ ] Configure email/password sign-in, disabled public sign-up, session policy, cookies, trusted origins and rate limits.
-- [ ] Confirm the Better Auth generated schema remains in sync after configuration changes.
-- [ ] Verify sign-in and sign-out against PostgreSQL.
-
-Exit criteria:
-
-- A seeded user can authenticate through the mounted route.
-- The server can retrieve the session from request headers.
-- No Better Auth secret or database code is included in the client bundle.
-- Auth failures are safe and generic.
-
-### Workstream D - Implement tenant context and policy
-
-Tasks:
-
-- [ ] Define the role and permission matrix.
-- [ ] Implement session-to-membership resolution.
-- [ ] Implement `requireSession`, `requireWorkspaceContext` and permission guards.
-- [ ] Implement organization and case read repositories.
-- [ ] Apply tenant predicates in every query.
-- [ ] Add safe case projections.
-- [ ] Add unit and database tenant-isolation tests.
-
-Exit criteria:
-
-- The repository API cannot accidentally perform an unscoped case read from web code.
-- Two-organization integration tests pass.
-- Missing and inaccessible case details map to one safe not-found behavior.
-
-### Workstream E - Build seed and fixtures for tests
-
-Tasks:
-
-- [ ] Add synthetic seed environment placeholders.
-- [ ] Implement the documented Better Auth seed path.
-- [ ] Upsert the demo organization.
-- [ ] Create verified analyst and supervisor users.
-- [ ] Upsert their memberships.
-- [ ] Add isolated test factories for a second organization and synthetic cases.
-- [ ] Run the seed twice and compare row counts.
-
-Exit criteria:
-
-- The normal seed produces exactly one demo organization and the expected memberships.
-- No password or hash is logged.
-- The normal seed produces zero cases.
-
-### Workstream F - Build the protected web shell
-
-Tasks:
-
-- [ ] Add sign-in and session-expired routes.
-- [ ] Replace the root setup placeholder with the session-aware redirect.
-- [ ] Add protected layout and navigation.
-- [ ] Add dashboard with tenant-scoped zero-case state.
-- [ ] Add case queue with empty and synthetic-data states.
-- [ ] Add case detail with safe not-found behavior.
-- [ ] Add sign-out behavior.
-- [ ] Test desktop, tablet and mobile layouts.
-- [ ] Test keyboard navigation and visible focus.
-
-Exit criteria:
-
-- The analyst browser flow works without developer tools.
-- The UI does not imply that upload or analysis is already implemented.
-- Protected pages perform server-side checks on every request.
-
-### Workstream G - Integrate CI and document the handoff
-
-Tasks:
-
-- [ ] Add database migration and seed commands to developer docs.
-- [ ] Add PostgreSQL-backed integration checks to CI.
-- [ ] Add the Playwright auth smoke flow.
-- [ ] Add generated-schema/migration review notes.
-- [ ] Run the complete verification sequence twice.
-- [ ] Record known limitations for Phase 3.
-
-Exit criteria:
-
-- A clean checkout can reach the signed-in empty dashboard using documented commands.
-- CI exercises the same migration, auth and isolation behavior as local development.
-
-## 14. Verification Sequence
-
-Run these in order. A later command must not mask an earlier failure.
-
-### 14.1 Static checks
+Recommended local commands:
 
 ```bash
+pnpm infra:up
+pnpm db:migrate
+pnpm dev:analyzer
+pnpm --filter @mailsentinel/analyzer dev:worker
+pnpm dev:web
+```
+
+If the worker is not running, an upload must remain usable and show `queued` or `analysis_deferred` according to the intake result.
+
+## 14. Ordered Execution Workstreams
+
+Do not start a later workstream until its exit criteria pass.
+
+### Workstream A - Freeze contract and migration design
+
+Tasks:
+
+- [ ] Run Phase 2 preflight checks.
+- [ ] Create ADR 0005 for upload transport, queue and failure semantics.
+- [ ] Confirm raw request-body streaming works with the installed Next.js runtime.
+- [ ] Confirm MinIO/S3 multipart behavior and cleanup API.
+- [ ] Define artifact, run, audit and idempotency schema changes.
+- [ ] Define analyzer Pydantic contract and stable error codes.
+- [ ] Define which worker outcome is `analysis_deferred` until Phase 4.
+
+Exit criteria:
+
+- No schema or transport decision is left implicit.
+- Web, analyzer and database owners agree on the request/response contract.
+
+### Workstream B - Extend PostgreSQL and repositories
+
+Tasks:
+
+- [ ] Add the idempotency key migration.
+- [ ] Add `evidence_artifacts` schema and indexes.
+- [ ] Add `analysis_runs` schema and indexes.
+- [ ] Add append-only `audit_events` schema and indexes.
+- [ ] Generate and review the Drizzle migration.
+- [ ] Apply it to clean and existing Phase 2 databases.
+- [ ] Add `createCaseIntake` transaction.
+- [ ] Add idempotency, duplicate-hash and safe ingestion projections.
+- [ ] Add conditional state transition helpers.
+- [ ] Add audit insert-only helper.
+
+Exit criteria:
+
+- Migrations are repeatable and contain no destructive unrelated changes.
+- A transaction can persist all intake metadata or none of it.
+- All repository reads remain tenant-scoped.
+
+### Workstream C - Implement S3/MinIO streaming storage
+
+Tasks:
+
+- [ ] Add AWS S3 client dependencies to the web package.
+- [ ] Implement validated server-only S3 client construction.
+- [ ] Implement opaque object-key generation.
+- [ ] Implement bounded streaming upload with SHA-256 and byte count.
+- [ ] Enforce content-length and streaming limits.
+- [ ] Verify object metadata after upload.
+- [ ] Implement abort/delete cleanup paths.
+- [ ] Add object-storage integration tests.
+
+Exit criteria:
+
+- A known synthetic byte stream can be uploaded and re-read with the same hash and size.
+- Over-limit and failed streams leave no committed artifact metadata.
+- No browser bundle contains storage credentials or object keys.
+
+### Workstream D - Build web intake route
+
+Tasks:
+
+- [ ] Add `POST /api/cases` on the Node runtime.
+- [ ] Add origin, session and permission checks before body consumption.
+- [ ] Add bounded request-header validation.
+- [ ] Add idempotency lookup before storage.
+- [ ] Add duplicate hash confirmation flow.
+- [ ] Call the transactional case-intake repository.
+- [ ] Map storage/database failures to safe responses.
+- [ ] Add analyzer-client timeout and error mapping.
+- [ ] Add queue-deferred conditional update.
+
+Exit criteria:
+
+- An analyst can create one queued case with one original artifact and one run.
+- Retry and duplicate behavior matches the contract.
+- Analyzer outage preserves the case and evidence.
+
+### Workstream E - Implement analyzer intake and worker
+
+Tasks:
+
+- [ ] Add Dramatiq/Redis dependencies and lockfile updates.
+- [ ] Add Pydantic intake request/response models.
+- [ ] Add service-token authentication.
+- [ ] Add database relation validation.
+- [ ] Add broker initialization and retry configuration.
+- [ ] Add the idempotent actor.
+- [ ] Add object size/hash verification.
+- [ ] Add safe `PARSER_NOT_AVAILABLE` deferred transition.
+- [ ] Add service audit events.
+- [ ] Update analyzer Docker/Compose commands.
+
+Exit criteria:
+
+- Valid intake requests enqueue exactly one run.
+- Invalid credentials and forged relationships are rejected.
+- Worker restart or duplicate delivery cannot create duplicate state.
+- No actor claims a verdict before Phase 4.
+
+### Workstream F - Add upload UI and status projection
+
+Tasks:
+
+- [ ] Add `/cases/new` under the existing protected layout.
+- [ ] Add upload progress and local validation.
+- [ ] Add duplicate confirmation UX.
+- [ ] Add `New case` navigation based on server-side permission.
+- [ ] Extend case list safe metadata.
+- [ ] Add case ingestion projection endpoint.
+- [ ] Add status polling with backoff/visibility handling.
+- [ ] Add queued/deferred/failed copy and loading states.
+- [ ] Keep raw email content and object keys out of the UI.
+
+Exit criteria:
+
+- Analyst can upload without developer tools.
+- UI explains what was preserved and what has not been analyzed.
+- Viewer cannot reach or submit the upload flow.
+
+### Workstream G - Contracts, tests and documentation
+
+Tasks:
+
+- [ ] Export and generate the analyzer OpenAPI contract.
+- [ ] Add unit, database, storage, route and analyzer tests.
+- [ ] Add the Playwright upload flow.
+- [ ] Add outage, duplicate, idempotency and integrity tests.
+- [ ] Update CI with PostgreSQL, Redis and MinIO test services.
+- [ ] Update README and developer setup commands.
+- [ ] Document synthetic transport fixture provenance.
+- [ ] Run the verification sequence twice.
+
+Exit criteria:
+
+- Required Phase 3 tests pass from a clean checkout.
+- CI does not silently skip database/storage/queue integration coverage.
+- The Phase 4 parser receives a stable artifact/run contract.
+
+## 15. Verification Sequence
+
+Run each stage in order and preserve failures for diagnosis.
+
+### 15.1 Static and dependency checks
+
+```bash
+pnpm install --frozen-lockfile
+uv sync --locked --project apps/analyzer
 pnpm format:check
 pnpm lint
 pnpm typecheck
 ```
 
-Confirm that both new packages and `apps/web` are included.
+Confirm generated OpenAPI and generated TypeScript types are deterministic if the contracts package is enabled.
 
-### 14.2 Clean database check
-
-Use a disposable PostgreSQL database or explicitly reset only the local development volume when it is safe to do so:
+### 15.2 Migration and seed checks
 
 ```bash
 pnpm infra:up
 pnpm db:migrate
 pnpm db:check
 pnpm db:seed
+pnpm db:migrate
 pnpm db:seed
 ```
 
 Verify:
 
-- The second migration run is a no-op.
-- The second seed run does not duplicate rows.
-- Better Auth core tables exist.
-- Organizations, memberships and cases tables exist.
-- The demo seed contains no cases.
+- Existing Phase 2 users and memberships still work.
+- New tables exist.
+- Second migration is a no-op.
+- Second seed creates no duplicate identity or tenancy rows.
+- Normal seed still contains no cases unless a separate demo upload is explicitly run.
 
-### 14.3 Auth and page check
+### 15.3 Storage check
 
-Start the web application using the documented command:
+Use a synthetic `.eml` fixture and verify:
+
+- Private bucket is reachable.
+- Upload stream completes.
+- PostgreSQL byte size equals the received byte count.
+- PostgreSQL SHA-256 equals the re-downloaded object SHA-256.
+- Object key uses opaque IDs.
+- No public read is possible.
+- Temporary objects are removed after duplicate rejection or transaction failure.
+
+### 15.4 Analyzer/queue check
+
+Start the analyzer and worker:
+
+```bash
+pnpm dev:analyzer
+pnpm --filter @mailsentinel/analyzer dev:worker
+```
+
+Verify:
+
+```bash
+curl --fail http://localhost:8000/health/live
+curl --fail http://localhost:8000/health/ready
+```
+
+Then test:
+
+- Missing token -> `401`.
+- Wrong token -> `401`.
+- Valid relation -> `202` and one Redis message.
+- Duplicate run -> no second message.
+- Worker validates object hash/size.
+- Worker ends at `analysis_deferred` with `PARSER_NOT_AVAILABLE`.
+
+### 15.5 Web flow check
+
+Start the web application:
 
 ```bash
 pnpm dev:web
 ```
 
-Verify manually or through Playwright:
+Verify:
 
-1. `/` redirects to `/sign-in` without a session.
-2. Direct `/dashboard` access redirects to `/sign-in` without a session.
-3. Analyst sign-in succeeds.
-4. Dashboard shows the demo organization and analyst role.
-5. `/cases` shows the empty state.
-6. Sign-out returns to `/sign-in`.
-7. A missing case renders not-found.
-8. Supervisor sign-in shows the supervisor role.
-9. A user without membership receives a safe denial.
+1. Anonymous `/cases/new` redirects to `/sign-in`.
+2. Viewer cannot access the upload action.
+3. Analyst can open `/cases/new`.
+4. Invalid file is rejected locally and server-side.
+5. Oversized file is rejected without a committed object.
+6. Valid synthetic `.eml` shows upload progress.
+7. Successful upload returns a case ID quickly.
+8. Case detail shows hash, byte size and queued/deferred state.
+9. Raw body, full headers and object key are absent from the page.
+10. Analyzer outage leaves the case available with `analysis_deferred`.
+11. Same idempotency key returns the original case.
+12. Same hash requires explicit duplicate confirmation.
+13. A cross-tenant case/artifact ID behaves as not found.
 
-### 14.4 Tenant test check
+### 15.6 Automated checks
 
 ```bash
-pnpm --filter @mailsentinel/db test
-pnpm --filter @mailsentinel/auth test
-pnpm --filter @mailsentinel/web test
 pnpm test
-```
-
-Confirm that tests include two organizations, known cross-tenant case IDs and role matrix assertions.
-
-### 14.5 Build check
-
-```bash
+TEST_DATABASE_URL="$DATABASE_URL" pnpm --filter @mailsentinel/db test
+TEST_DATABASE_URL="$DATABASE_URL" pnpm --filter @mailsentinel/auth test
+pnpm test:e2e
 pnpm build
-git diff --check
 ```
 
-Inspect the build output and client bundle boundaries for accidental server-only imports or environment values. Do not treat a successful build as proof of authorization; the isolation tests are required.
+Run integration tests with real PostgreSQL/Redis/MinIO in CI. Do not mark a skipped integration suite as Phase 3 verification.
 
-## 15. Phase 2 Acceptance Checklist
+### 15.7 Repeatability and cleanup
 
-### Data
+- Run the same upload twice with the same idempotency key.
+- Run the same upload twice with different keys and confirm duplicate behavior.
+- Stop the worker while an upload is accepted; confirm the case remains queued.
+- Stop Redis during intake; confirm evidence is preserved and run is deferred.
+- Stop MinIO during upload; confirm no committed artifact row exists.
+- Restart the worker and confirm no duplicate state is written.
+- Reset only disposable local data when intentionally testing clean migrations.
+- Confirm `git diff --check` and no populated environment files are tracked.
 
-- [ ] `@mailsentinel/db` owns the PostgreSQL and Drizzle setup.
-- [ ] Better Auth schema was generated from the installed version and reviewed.
-- [ ] Application migrations are committed and repeatable.
-- [ ] `organizations`, `organization_members` and `cases` have tenant constraints and indexes.
-- [ ] No future evidence or verdict data is populated as a fake result.
+## 16. Phase 3 Acceptance Checklist
 
-### Authentication
+### Intake authorization
 
-- [ ] Email/password sign-in works for seeded analyst and supervisor users.
-- [ ] Public sign-up is disabled in the mounted runtime.
-- [ ] Sign-out invalidates the session.
-- [ ] Sessions are stored in PostgreSQL for this phase.
-- [ ] Cookies are HTTP-only and same-site, with secure production behavior.
-- [ ] CSRF and origin protections remain enabled.
-- [ ] Auth rate limiting is enabled and tested at the configured boundary.
-- [ ] Auth errors do not disclose account state, secrets or stack traces.
+- [ ] Anonymous users cannot upload.
+- [ ] Viewers cannot upload.
+- [ ] Analysts, supervisors and admins can upload.
+- [ ] Session and membership are resolved by Phase 2 server code.
+- [ ] Origin validation runs before body storage.
+- [ ] Organization/user/role values are never trusted from the browser.
 
-### Authorization
+### Validation and preservation
 
-- [ ] The four application roles are typed and explicitly mapped to permissions.
-- [ ] Session, membership and role are resolved server-side.
-- [ ] Every case repository query includes the resolved organization predicate.
-- [ ] Browser-supplied organization IDs and roles cannot grant access.
-- [ ] Missing membership fails closed.
-- [ ] Cross-tenant reads return the same safe result as missing records.
-- [ ] Viewer, analyst, supervisor and admin matrix tests pass.
+- [ ] Only bounded `.eml` uploads are accepted.
+- [ ] Filename is sanitized and cannot create a path traversal.
+- [ ] Content type is checked but not treated as proof of message validity.
+- [ ] Known oversized requests are rejected before storage.
+- [ ] Chunked oversized requests abort safely.
+- [ ] Empty uploads are rejected.
+- [ ] SHA-256 is calculated from exact received bytes.
+- [ ] Stored object size and hash are verified.
+- [ ] Original object is immutable and stored privately.
+- [ ] Object key contains no sender, subject or raw filename.
 
-### Web shell
+### Database and audit
 
-- [ ] Unauthenticated users are redirected to sign-in.
-- [ ] `/dashboard`, `/cases` and `/cases/[caseId]` are protected.
-- [ ] The dashboard and queue show truthful empty states.
-- [ ] Case detail does not reveal inaccessible case existence.
-- [ ] Sign-out and session-expiry behavior are understandable.
-- [ ] No upload, analysis, map, verdict or report feature is falsely presented as ready.
-- [ ] Keyboard, focus and responsive checks pass.
+- [ ] Case, artifact and analysis run are created transactionally.
+- [ ] Original filename, byte size, hash, object metadata, receive time and submitting user are recorded safely.
+- [ ] Retention deadline is populated from validated configuration.
+- [ ] `case.created` and `evidence.uploaded` events are appended.
+- [ ] Queue/deferred/failure events are appended with service identity.
+- [ ] Audit helpers do not expose update/delete behavior.
+- [ ] All artifact/run/audit reads are tenant-scoped.
 
-### Engineering
+### Duplicate and retry safety
 
-- [ ] Seed is idempotent and uses synthetic values only.
-- [ ] Passwords and hashes never appear in source, logs, screenshots or CI output.
-- [ ] Root checks include the new packages.
-- [ ] CI runs migrations and PostgreSQL-backed isolation tests.
-- [ ] Browser smoke tests cover sign-in and protected navigation.
-- [ ] README and development setup docs describe the new commands and boundaries.
-- [ ] `PLAN.md` remains unchanged by this phase-document replacement.
+- [ ] Same idempotency key returns the same case within one organization.
+- [ ] Same key with different bytes is rejected.
+- [ ] Same hash in the same organization requires explicit confirmation.
+- [ ] Same hash in another organization does not affect the response.
+- [ ] Temporary objects are cleaned after duplicate rejection.
+- [ ] Client disconnect/retry does not create duplicate metadata.
 
-## 16. Handoff To Phase 3
+### Analyzer and queue
 
-Phase 3 may begin only after the Phase 2 acceptance checklist passes.
+- [ ] FastAPI intake requires the internal service token.
+- [ ] Token comparison is constant-time and never logged.
+- [ ] Request relation validation prevents forged case/artifact/run combinations.
+- [ ] Valid request returns `202` quickly.
+- [ ] Dramatiq message identity is tied to `analysis_run_id`.
+- [ ] Worker delivery is idempotent.
+- [ ] Worker verifies object size/hash before later parser work.
+- [ ] Queue/storage/analyzer outage preserves evidence.
+- [ ] Phase 3 never creates a verdict or claims `completed`.
 
-Phase 3 must reuse:
+### Web experience
 
-- The Better Auth server/client boundary.
-- `getSessionContext()` and permission guards.
-- `@mailsentinel/db` migration workflow.
-- Tenant-scoped repositories and ID rules.
-- The `cases` table and status vocabulary.
-- The seeded demo organization and synthetic test factories.
-- The PostgreSQL and MinIO local services.
+- [ ] `/cases/new` is protected and role-aware.
+- [ ] Upload progress, loading, duplicate, deferred and failure states are understandable.
+- [ ] Case detail displays safe chain-of-custody metadata.
+- [ ] Status polling stops/backoffs correctly.
+- [ ] Raw email content, full headers and object keys are not rendered.
+- [ ] UI is usable on mobile, tablet and desktop widths.
+- [ ] Keyboard navigation and focus states work.
 
-Phase 3 must add, rather than bypass:
+### Quality
 
-- `evidence_artifacts`, `analysis_runs` and audit records through new migrations.
-- A protected upload route that calls the existing permission policy.
-- Server-generated case IDs and tenant-owned object keys.
-- Hash verification and transactional case/run writes.
-- Analyzer intake authentication and queue submission.
-- Queued/progress/failure states backed by persisted data.
+- [ ] Unit, database, storage, analyzer and browser tests pass.
+- [ ] CI runs disposable PostgreSQL, Redis and MinIO-backed integration coverage.
+- [ ] OpenAPI generation is deterministic and drift-checked.
+- [ ] `pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test` and `pnpm build` pass.
+- [ ] No secret, raw message, provider response or populated environment file is committed.
+- [ ] README, development setup and ADR document the Phase 3 commands and limitations.
 
-Phase 3 must not:
+## 17. Handoff To Phase 4
 
-- Create a second auth system.
-- Read cases without the Phase 2 tenant predicate.
-- Accept organization membership from a browser field.
-- Put raw email content in the case table or logs.
-- Treat the Phase 2 empty UI as evidence that ingestion exists.
+Phase 4 may begin only after the Phase 3 acceptance checklist passes.
 
-## 17. References
+Phase 4 must reuse:
 
-Read these before implementation and prefer the installed package documentation when it differs from an online example:
+- The existing `evidence_artifacts` original object and verified SHA-256.
+- The `analysis_runs` row and `analysis_run_id` idempotency identity.
+- The persisted `queued`/`analysis_deferred` lifecycle.
+- The authenticated analyzer contract and worker broker.
+- The safe object retrieval and integrity-verification helper.
+- The tenant-scoped repository and audit helper.
+- The case status polling/projection contract.
 
-- `PLAN.md`, sections 11, 12, 18, 21 and Phase 2.
-- Better Auth Next.js integration: <https://better-auth.com/docs/integrations/next>
-- Better Auth Drizzle adapter: <https://better-auth.com/docs/adapters/drizzle>
-- Better Auth database and schema guidance: <https://better-auth.com/docs/concepts/database>
-- Better Auth CLI: <https://better-auth.com/docs/concepts/cli>
-- Better Auth email/password guidance: <https://better-auth.com/docs/authentication/email-password>
-- Better Auth session management: <https://better-auth.com/docs/concepts/session-management>
-- Better Auth security reference: <https://better-auth.com/docs/reference/security>
-- Better Auth options reference: <https://better-auth.com/docs/reference/options>
-- Next.js installed guides under `node_modules/next/dist/docs/`.
+Phase 4 may replace only the safe deferred worker body with parser stages:
 
-The implementation is complete only when it preserves the evidence boundary for the next phase: identity is real, tenancy is explicit, and every case read is traceable to a server-resolved organization context.
+```text
+verified original object
+  -> safe MIME parser
+  -> extraction observations
+  -> persisted warnings and metadata
+```
+
+Phase 4 must not:
+
+- Reimplement upload or hash calculation.
+- Trust an object key or organization ID from a browser.
+- Modify the original object.
+- Treat an unverified artifact as parser input.
+- Put raw email content in logs or unrestricted web responses.
+- Skip the existing `analysis_run_id` idempotency checks.
+
+The next phase is successful only when evidence preservation remains true even when parsing, storage, Redis or analyzer dependencies fail.

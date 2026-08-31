@@ -3,6 +3,5 @@ export async function register(): Promise<void> {
 		return;
 	}
 
-	const { getServerEnv } = await import("./server/env");
-	getServerEnv();
+	await import("./server/env");
 }

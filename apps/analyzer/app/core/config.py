@@ -23,13 +23,23 @@ class Settings(BaseSettings):
     )
     analysis_version: str = Field(default="prototype-1", alias="ANALYSIS_VERSION")
     provider_mode: Literal["fixture", "offline", "live"] = Field(
-        default="fixture", alias="ENRICHMENT_MODE"
+        default="offline", alias="ENRICHMENT_MODE"
     )
     database_url: str = Field(
         default="postgresql://mailsentinel:replace-me@postgres:5432/mailsentinel",
         alias="DATABASE_URL",
     )
     redis_url: str = Field(default="redis://:replace-me@redis:6379/0", alias="REDIS_URL")
+    dramatiq_queue_name: str = Field(
+        default="mailsentinel.analysis", alias="DRAMATIQ_QUEUE_NAME", min_length=1, max_length=128
+    )
+    dramatiq_max_retries: int = Field(default=3, alias="DRAMATIQ_MAX_RETRIES", ge=0, le=10)
+    dramatiq_min_backoff_ms: PositiveInt = Field(
+        default=1000, alias="DRAMATIQ_MIN_BACKOFF_MS", le=300_000
+    )
+    dramatiq_max_backoff_ms: PositiveInt = Field(
+        default=30_000, alias="DRAMATIQ_MAX_BACKOFF_MS", le=3_600_000
+    )
     s3_endpoint: AnyUrl = Field(default=AnyUrl("http://minio:9000"), alias="S3_ENDPOINT")
     s3_region: str = Field(default="us-east-1", alias="S3_REGION")
     s3_bucket: str = Field(default="mailsentinel-evidence", alias="S3_BUCKET")
@@ -38,6 +48,9 @@ class Settings(BaseSettings):
         default=SecretStr("replace-me"), alias="S3_SECRET_ACCESS_KEY"
     )
     s3_force_path_style: bool = Field(default=True, alias="S3_FORCE_PATH_STYLE")
+    s3_request_timeout_seconds: PositiveInt = Field(
+        default=10, alias="S3_REQUEST_TIMEOUT_SECONDS", le=300
+    )
     analyzer_service_token: SecretStr | None = Field(default=None, alias="ANALYZER_SERVICE_TOKEN")
     max_eml_bytes: PositiveInt = Field(default=26214400, alias="MAX_EML_BYTES")
     max_mime_parts: PositiveInt = Field(default=200, alias="MAX_MIME_PARTS")
@@ -64,6 +77,13 @@ class Settings(BaseSettings):
         parsed = urlparse(value)
         if parsed.scheme != "redis" or not parsed.hostname:
             raise ValueError("REDIS_URL must be a Redis URL")
+        return value
+
+    @field_validator("dramatiq_queue_name")
+    @classmethod
+    def validate_queue_name(cls, value: str) -> str:
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+            raise ValueError("DRAMATIQ_QUEUE_NAME cannot contain control characters")
         return value
 
     @field_validator("s3_endpoint")

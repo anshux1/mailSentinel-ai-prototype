@@ -8,6 +8,10 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
   "pydantic>=2.7.0",
   "pydantic-settings>=2.4.0",
+  "boto3>=1.35.0",
+  "dramatiq[redis]>=1.17.0",
+  "psycopg[binary]>=3.2.0",
+  "redis>=5.0.0",
 ]
 
 [dependency-groups]

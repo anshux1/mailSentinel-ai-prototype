@@ -16,6 +16,7 @@ export interface CaseProjection {
 	title: string;
 	status: CaseStatus;
 	priority: CasePriority;
+	originalFilename: string | null;
 	createdAt: Date;
 	updatedAt: Date;
 }
@@ -34,6 +35,7 @@ const caseProjection = {
 	title: cases.title,
 	status: cases.status,
 	priority: cases.priority,
+	originalFilename: cases.originalFilename,
 	createdAt: cases.createdAt,
 	updatedAt: cases.updatedAt,
 };

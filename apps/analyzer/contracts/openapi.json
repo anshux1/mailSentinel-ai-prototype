@@ -1,0 +1,290 @@
+{
+  "components": {
+    "schemas": {
+      "AnalysisAcceptedResponse": {
+        "properties": {
+          "acceptedAt": {
+            "format": "date-time",
+            "title": "Acceptedat",
+            "type": "string"
+          },
+          "analysisRunId": {
+            "title": "Analysisrunid",
+            "type": "string"
+          },
+          "requestId": {
+            "title": "Requestid",
+            "type": "string"
+          },
+          "status": {
+            "const": "queued",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "analysisRunId",
+          "status",
+          "acceptedAt",
+          "requestId"
+        ],
+        "title": "AnalysisAcceptedResponse",
+        "type": "object"
+      },
+      "AnalysisErrorResponse": {
+        "properties": {
+          "caseId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Caseid"
+          },
+          "code": {
+            "enum": [
+              "INVALID_SERVICE_CREDENTIALS",
+              "INVALID_REQUEST_RELATION",
+              "DUPLICATE_OR_STALE_RUN",
+              "QUEUE_UNAVAILABLE",
+              "STORAGE_UNAVAILABLE",
+              "ARTIFACT_INTEGRITY_MISMATCH",
+              "PARSER_NOT_AVAILABLE"
+            ],
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "requestId": {
+            "title": "Requestid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "requestId"
+        ],
+        "title": "AnalysisErrorResponse",
+        "type": "object"
+      },
+      "AnalysisIntakeRequest": {
+        "additionalProperties": false,
+        "description": "Authenticated web-to-analyzer intake contract.\n\nThe artifact reference is never accepted from a browser.  The service token\nand the relation check in PostgreSQL are what make this reference trusted.",
+        "properties": {
+          "analysisRunId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Analysisrunid",
+            "type": "string"
+          },
+          "artifact": {
+            "$ref": "#/components/schemas/ArtifactReference"
+          },
+          "caseId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Caseid",
+            "type": "string"
+          },
+          "organizationId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Organizationid",
+            "type": "string"
+          },
+          "requestId": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "Requestid",
+            "type": "string"
+          },
+          "requestedAt": {
+            "format": "date-time",
+            "title": "Requestedat",
+            "type": "string"
+          }
+        },
+        "required": [
+          "caseId",
+          "organizationId",
+          "analysisRunId",
+          "artifact",
+          "requestedAt",
+          "requestId"
+        ],
+        "title": "AnalysisIntakeRequest",
+        "type": "object"
+      },
+      "ArtifactReference": {
+        "additionalProperties": false,
+        "properties": {
+          "byteSize": {
+            "maximum": 26214400.0,
+            "minimum": 0.0,
+            "title": "Bytesize",
+            "type": "integer"
+          },
+          "objectKey": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Objectkey",
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Sha256",
+            "type": "string"
+          }
+        },
+        "required": [
+          "objectKey",
+          "sha256",
+          "byteSize"
+        ],
+        "title": "ArtifactReference",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "mailsentinel-analyzer",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/health/live": {
+      "get": {
+        "operationId": "live_health_live_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Live Health Live Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Live",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "operationId": "ready_health_ready_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Ready Health Ready Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Ready",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/v1/analyses": {
+      "post": {
+        "operationId": "create_analysis_v1_analyses_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisIntakeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisAcceptedResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisErrorResponse"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisErrorResponse"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisErrorResponse"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisErrorResponse"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "summary": "Create Analysis",
+        "tags": [
+          "analyses"
+        ]
+      }
+    }
+  }
+}

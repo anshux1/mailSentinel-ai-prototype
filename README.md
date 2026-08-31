@@ -1,6 +1,6 @@
 # MailSentinel
 
-MailSentinel is a polyglot monorepo for the MailSentinel product foundation. Phase 2 provides PostgreSQL-backed identity, tenant roles and a protected case shell; evidence ingestion and analysis remain deferred to the next phase.
+MailSentinel is a polyglot monorepo for the MailSentinel product foundation. Phase 3 preserves bounded raw `.eml` evidence, creates tenant-scoped case metadata and queues authenticated analyzer intake; forensic parsing and verdicts remain deferred to the next phase.
 
 ## Repository contents
 
@@ -11,6 +11,7 @@ MailSentinel is a polyglot monorepo for the MailSentinel product foundation. Pha
 - `packages/ui`: shared React components
 - `packages/db`: Drizzle schema, migrations, repositories and synthetic seed
 - `packages/auth`: Better Auth server/client boundary and application permissions
+- `packages/contracts`: generated TypeScript types for the analyzer OpenAPI contract
 - `infra/`: local PostgreSQL, Redis, and MinIO Compose stack
 - `docs/`: development setup and architecture decision records
 - `.github/workflows/`: CI checks for both language workspaces
@@ -44,9 +45,14 @@ MailSentinel is a polyglot monorepo for the MailSentinel product foundation. Pha
    ```bash
    pnpm db:seed
    ```
-8. Start the analyzer and web app in separate terminals:
+8. Generate the analyzer contract:
+   ```bash
+   pnpm contracts:generate
+   ```
+9. Start the analyzer, worker and web app in separate terminals:
    ```bash
    pnpm dev:analyzer
+   pnpm --filter @mailsentinel/analyzer dev:worker
    pnpm dev:web
    ```
 
@@ -64,7 +70,8 @@ Open `http://localhost:3000` and sign in with the synthetic analyst credentials 
 - `pnpm db:generate` generates a reviewed Drizzle migration.
 - `pnpm db:migrate` applies committed migrations.
 - `pnpm db:seed` creates synthetic demo users and memberships idempotently.
-- `pnpm test:e2e` runs the Playwright authentication smoke flow.
+- `pnpm contracts:generate` exports the analyzer OpenAPI contract and regenerates its TypeScript types.
+- `pnpm test:e2e` runs the Playwright authentication and evidence-intake smoke flow.
 - `pnpm format:check` verifies supported formatting without changing files.
 - `pnpm infra:down` stops infrastructure and preserves named volumes.
 - `pnpm infra:reset` deletes local volumes after an explicit confirmation.

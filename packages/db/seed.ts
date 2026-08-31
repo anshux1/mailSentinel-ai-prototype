@@ -6,14 +6,10 @@ import { db, pool } from "./src/client";
 import { getSeedEnvironment } from "./src/env";
 import { account, organizationMembers, organizations, user } from "./src/schema";
 
-const authSecret = process.env.BETTER_AUTH_SECRET?.trim();
-if (!authSecret || authSecret.length < 32) {
-	throw new Error("BETTER_AUTH_SECRET must be set to at least 32 characters for seeding");
-}
-
+const seedEnvironment = getSeedEnvironment();
 const seedAuth = betterAuth({
-	baseURL: process.env.BETTER_AUTH_URL?.trim() || "http://localhost:3000",
-	secret: authSecret,
+	baseURL: seedEnvironment.authBaseUrl,
+	secret: seedEnvironment.authSecret,
 	database: drizzleAdapter(db, { provider: "pg" }),
 	emailAndPassword: {
 		enabled: true,
@@ -82,7 +78,6 @@ async function ensureUser(input: SeedUser): Promise<typeof user.$inferSelect> {
 }
 
 async function seed(): Promise<void> {
-	const seedEnvironment = getSeedEnvironment();
 	const analyst = await ensureUser({
 		name: "Demo Analyst",
 		email: seedEnvironment.analystEmail,

@@ -12,3 +12,4 @@ SETUP_PLAN.md
 *.py
 Dockerfile
 next-env.d.ts
+apps/analyzer/contracts/openapi.json
